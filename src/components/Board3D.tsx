@@ -20,6 +20,7 @@ export default function Board3D({
 }) {
   const {
     pieces,
+    myColor,
     selected,
     legalDestinations,
     camera,
@@ -96,9 +97,9 @@ export default function Board3D({
           style={{ transform: 'translateZ(1px)' }}
         >
           {Array.from({ length: 100 }).map((_, i) => {
-            const x = i % 10;
+            const x = myColor === 'black' ? 9 - (i % 10) : i % 10;
             const y = Math.floor(i / 10);
-            const displayY = 9 - y;
+            const displayY = myColor === 'black' ? y : 9 - y;
             const isDark = (x + displayY) % 2 === 1;
 
             let playableSq: number | null = null;
