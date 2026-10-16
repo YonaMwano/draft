@@ -51,7 +51,7 @@ function GameRoomInner() {
     soundEnabled,
   } = useGameStore();
 
-  const { status: connStatus, opponentOnline, onEvent, broadcast, setOpponentOnline } =
+  const { status: connStatus, opponentOnline, onEvent, broadcast, setOpponentOnline, syncing } =
     useMultiplayer(roomId, roomCode, myRole);
 
   const [boardSize, setBoardSize] = useState(340);
@@ -111,7 +111,7 @@ function GameRoomInner() {
         return;
       }
       if (ev.type !== 'move-made') return;
-      if (ev.by === myRole) return; // ignore echo of own move
+
 
       setLiveMode(true);
       setOpponentOnline(true);
@@ -129,6 +129,7 @@ function GameRoomInner() {
         selected: null,
         legalDestinations: [],
         legalMoves: [],
+        hopPath: [],
         whiteMs: ev.whiteMs,
         blackMs: ev.blackMs,
         status: (ev.status as any) || 'active',
@@ -159,46 +160,22 @@ function GameRoomInner() {
     });
   }, [onEvent, myRole, soundEnabled, setOpponentOnline]);
 
-  // After local move, broadcast to opponent
-  const prevTurn = useRef(turn);
-  useEffect(() => {
-    if (applyingRemote.current) return;
-    if (!isOnlineRoom) return;
-    if (prevTurn.current === turn) return;
-    // Turn changed → a move was made locally
-    const s = useGameStore.getState();
-    if (!s.engine) {
-      prevTurn.current = turn;
-      return;
-    }
-    // Only broadcast if WE just moved (turn is now opponent's)
-    const weJustMoved =
-      (myRole === 'white' && turn === 'black') || (myRole === 'black' && turn === 'white');
-    if (weJustMoved || s.status === 'finished') {
-      lastMovePly.current += 1;
-      broadcast({
-        type: 'move-made',
-        from: 0,
-        path: [],
-        captures: [],
-        pieces: s.pieces,
-        turn: s.turn,
-        whiteMs: s.whiteMs,
-        blackMs: s.blackMs,
-        status: s.status,
-        winner: s.winner,
-        resultReason: s.resultReason,
-        ply: lastMovePly.current,
-        by: myRole,
-      });
-      if (liveMode || opponentOnline) setLiveMode(true);
-    }
-    prevTurn.current = turn;
-  }, [turn, status, isOnlineRoom, myRole, broadcast, liveMode, opponentOnline]);
+  // Subscribe synchronously so remote snapshots cannot be echoed as local moves.
+  useEffect(() => useGameStore.subscribe((s, previous) => {
+    if (!isOnlineRoom || applyingRemote.current || !s.engine) return;
+    if (s.pieces === previous.pieces && s.status === previous.status) return;
+    lastMovePly.current += 1;
+    void broadcast({
+      type: 'move-made', from: 0, path: [], captures: [],
+      pieces: s.pieces, turn: s.turn, whiteMs: s.whiteMs, blackMs: s.blackMs,
+      status: s.status, winner: s.winner, resultReason: s.resultReason,
+      ply: lastMovePly.current, by: myRole,
+    });
+  }), [isOnlineRoom, myRole, broadcast]);
 
   // Bot only when NOT live multiplayer (solo practice in room)
   useEffect(() => {
-    if (liveMode || opponentOnline) return; // real opponent — no bot
+    if (isOnlineRoom || liveMode || opponentOnline) return; // real opponent — no bot
     if (!isHost) return; // guest waits; no bot on guest side when alone is ok — guest can also practice
     if (status !== 'active' || turn !== 'black' || !engine || botThinking.current) return;
 
@@ -246,7 +223,7 @@ function GameRoomInner() {
       clearTimeout(t);
       botThinking.current = false;
     };
-  }, [turn, status, engine, liveMode, opponentOnline, isHost]);
+  }, [turn, status, engine, liveMode, opponentOnline, isHost, isOnlineRoom]);
 
   const cycleCamera = useCallback(() => {
     const modes: CameraMode[] = ['tilted', 'immersive', 'tactical', 'topdown'];
@@ -257,6 +234,7 @@ function GameRoomInner() {
   // I can move only on my color's turn
   const canMove =
     status === 'active' &&
+    (!isOnlineRoom || (connStatus === 'connected' && !syncing && opponentOnline)) &&
     ((myRole === 'white' && turn === 'white') || (myRole === 'black' && turn === 'black'));
 
   // For guest (black), flip board so pink pieces are at bottom
@@ -461,24 +439,10 @@ function GameRoomInner() {
         <button
           type="button"
           className="action-btn"
+          disabled={isOnlineRoom && (syncing || connStatus !== 'connected')}
           onClick={() => {
             newGame();
-            lastMovePly.current = 0;
-            broadcast({
-              type: 'move-made',
-              from: 0,
-              path: [],
-              captures: [],
-              pieces: useGameStore.getState().pieces,
-              turn: 'white',
-              whiteMs: 180000,
-              blackMs: 180000,
-              status: 'active',
-              winner: null,
-              resultReason: null,
-              ply: 0,
-              by: myRole,
-            });
+
           }}
         >
           <span className="text-base">⟲</span>
@@ -487,8 +451,11 @@ function GameRoomInner() {
         <button
           type="button"
           className="action-btn danger"
-          onClick={resign}
-          disabled={status !== 'active'}
+          onClick={() => {
+            if (!isOnlineRoom) { resign(); return; }
+            useGameStore.setState({ status: 'finished', winner: myRole === 'white' ? 'black' : 'white', resultReason: 'resignation' });
+          }}
+          disabled={status !== 'active' || (isOnlineRoom && (syncing || connStatus !== 'connected'))}
         >
           <span className="text-base">🏳</span>
           <span>Resign</span>
@@ -508,6 +475,7 @@ function GameRoomInner() {
             <div className="flex gap-3 mt-6">
               <button
                 type="button"
+                disabled={isOnlineRoom && (syncing || connStatus !== 'connected')}
                 onClick={() => {
                   setShowResult(false);
                   newGame();
