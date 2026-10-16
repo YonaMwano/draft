@@ -67,7 +67,7 @@ function PlayContent() {
     setCreatedGameId(null);
 
     const localCode = generateCode(6);
-    let gameId = localCode.toLowerCase();
+    const gameId = localCode.toLowerCase();
     let usedApi = false;
 
     try {
