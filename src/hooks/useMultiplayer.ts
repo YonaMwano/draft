@@ -1,192 +1,125 @@
 'use client';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { LocalGame, type Color } from '@/lib/localEngine';
+import { useGameStore } from '@/store/gameStore';
+import type { RoomState } from '../../db/schema';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { createPusherClient, channels } from '@/lib/pusher';
-import type { Piece, Move, Color } from '@/lib/localEngine';
-
-export type ConnStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
-
-export type MpEvent =
-  | {
-      type: 'move-made';
-      from: number;
-      path: number[];
-      captures: number[];
-      pieces: Piece[];
-      turn: Color;
-      whiteMs: number;
-      blackMs: number;
-      status: string;
-      winner?: Color | 'draw' | null;
-      resultReason?: string | null;
-      ply: number;
-      by: string; // role host|guest
-    }
-  | { type: 'player-joined'; role: string; code: string }
-  | { type: 'player-ready'; role: string }
-  | { type: 'heartbeat'; role: string; at: number };
-
-/**
- * Real-time channel for a private game room.
- * Uses Pusher when configured; falls back to BroadcastChannel (same browser)
- * + short polling so two tabs can still play.
- */
-export function useMultiplayer(roomId: string, code: string, role: string) {
-  const [status, setStatus] = useState<ConnStatus>('connecting');
+type Reply = { state: RoomState; version: number; role: Color; opponentOnline: boolean; incrementMs: number; error?: string };
+export function useMultiplayer(_roomId: string, code: string, _role: string) {
+  const [status, setStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'error'>('connecting');
   const [opponentOnline, setOpponentOnline] = useState(false);
-  const handlers = useRef<Set<(e: MpEvent) => void>>(new Set());
-  const pusherRef = useRef<ReturnType<typeof createPusherClient> | null>(null);
-  const channelRef = useRef<any>(null);
-
-  const onEvent = useCallback((fn: (e: MpEvent) => void) => {
-    handlers.current.add(fn);
-    return () => {
-      handlers.current.delete(fn);
-    };
-  }, []);
-
-  const emitLocal = useCallback((e: MpEvent) => {
-    handlers.current.forEach((fn) => {
-      try {
-        fn(e);
-      } catch (_) {}
-    });
-  }, []);
-
-  const broadcast = useCallback(
-    async (event: MpEvent) => {
-      // 1) BroadcastChannel (instant, same device / tabs)
-      try {
-        const bc = new BroadcastChannel(`drafts-${code || roomId}`);
-        bc.postMessage(event);
-        bc.close();
-      } catch (_) {}
-
-      // 2) localStorage event bus (cross-tab)
-      try {
-        localStorage.setItem(
-          `drafts-mp:${code || roomId}`,
-          JSON.stringify({ ...event, _t: Date.now() })
-        );
-      } catch (_) {}
-
-      // 3) Pusher (true multiplayer across devices)
-      try {
-        if (channelRef.current && status === 'connected') {
-          // client events need enabled on Pusher dashboard; also try REST via API
-        }
-        await fetch('/api/games/sync', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            roomId,
-            code,
-            role,
-            event,
-          }),
-        }).catch(() => {});
-      } catch (_) {}
-    },
-    [roomId, code, role, status]
-  );
+  const [role, setRole] = useState<Color>('white');
+  const [ready, setReady] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState('');
+  const requestRef = useRef<(event?: unknown) => Promise<void>>(async () => {});
+  const retry = useCallback(() => { void requestRef.current(); }, []);
+  const resign = useCallback(() => { void requestRef.current({ type: 'resign' }); }, []);
 
   useEffect(() => {
-    if (!roomId && !code) return;
-    const key = code || roomId;
-    let cancelled = false;
-
-    // BroadcastChannel listener
-    let bc: BroadcastChannel | null = null;
-    try {
-      bc = new BroadcastChannel(`drafts-${key}`);
-      bc.onmessage = (msg) => {
-        if (msg?.data?.type) emitLocal(msg.data as MpEvent);
-        if (msg?.data?.type === 'player-joined' || msg?.data?.type === 'heartbeat') {
-          setOpponentOnline(true);
-        }
-      };
-    } catch (_) {}
-
-    // storage listener
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== `drafts-mp:${key}` || !e.newValue) return;
-      try {
-        const data = JSON.parse(e.newValue);
-        if (data?.type) emitLocal(data);
-        if (data?.type === 'player-joined' || data?.type === 'move-made') {
-          setOpponentOnline(true);
-        }
-      } catch (_) {}
+    if (!code) return;
+    let stopped = false;
+    let busy = false;
+    let queued: unknown;
+    let applying = false;
+    let version = -1;
+    let myRole: Color = 'white';
+    let initialized = false;
+    const controller = new AbortController();
+    setReady(false);
+    setStatus('connecting');
+    const apply = (data: Reply, force = false) => {
+      const state = data.state;
+      const current = useGameStore.getState();
+      if (force || data.version !== version || !initialized || current.status !== (state.status === 'waiting' ? 'idle' : state.status)) {
+        const engine = new LocalGame();
+        engine.pieces = state.pieces.map(p => ({ ...p }));
+        engine.turn = state.turn;
+        engine.winner = state.winner;
+        engine.resultReason = state.resultReason;
+        const legalMoves = engine.legalMoves();
+        const maxCaptures = Math.max(0, ...legalMoves.map(m => m.captures.length));
+        applying = true;
+        useGameStore.setState({ engine, pieces: engine.getPieces(), turn: state.turn,
+          status: state.status === 'waiting' ? 'idle' : state.status,
+          winner: state.winner, resultReason: state.resultReason,
+          selected: null, legalDestinations: [], hopPath: [], legalMoves,
+          captureRequired: maxCaptures > 0, maxCaptures,
+          whiteMs: state.whiteMs, blackMs: state.blackMs, lastTick: Date.now(), incrementMs: data.incrementMs,
+        });
+        applying = false;
+      } else {
+        // Preserve a player's selected piece while correcting clock drift.
+        useGameStore.setState({ whiteMs: state.whiteMs, blackMs: state.blackMs, lastTick: Date.now() });
+      }
+      version = data.version;
+      initialized = true;
+      myRole = data.role;
+      setRole(data.role);
+      setOpponentOnline(data.opponentOnline);
+      setReady(true);
+      setStatus('connected');
+      setError('');
     };
-    window.addEventListener('storage', onStorage);
-
-    // Pusher
-    try {
-      const client = createPusherClient();
-      pusherRef.current = client;
-      const chName = `private-game-${key}`;
-      // public channel works without auth endpoint
-      const ch = client.subscribe(`game-${key}`);
-      channelRef.current = ch;
-
-      client.connection.bind('connected', () => {
-        if (!cancelled) setStatus('connected');
-      });
-      client.connection.bind('disconnected', () => {
-        if (!cancelled) setStatus('disconnected');
-      });
-      client.connection.bind('error', () => {
-        if (!cancelled) setStatus('error');
-      });
-
-      ch.bind('move-made', (data: MpEvent) => emitLocal(data));
-      ch.bind('player-joined', (data: MpEvent) => {
-        setOpponentOnline(true);
-        emitLocal(data);
-      });
-      ch.bind('pusher:subscription_succeeded', () => {
-        if (!cancelled) setStatus('connected');
-      });
-
-      // announce join
-      setTimeout(() => {
-        broadcast({ type: 'player-joined', role, code: key });
-      }, 300);
-
-      // heartbeat
-      const hb = setInterval(() => {
-        broadcast({ type: 'heartbeat', role, at: Date.now() });
-      }, 5000);
-
-      // If Pusher never connects, still mark connected for local channels
-      const fallback = setTimeout(() => {
-        if (!cancelled) setStatus((s) => (s === 'connecting' ? 'connected' : s));
-      }, 2000);
-
-      return () => {
-        cancelled = true;
-        clearInterval(hb);
-        clearTimeout(fallback);
-        window.removeEventListener('storage', onStorage);
-        try {
-          bc?.close();
-        } catch (_) {}
-        try {
-          client.unsubscribe(`game-${key}`);
-          client.disconnect();
-        } catch (_) {}
-      };
-    } catch {
-      setStatus('connected'); // local-only mode
-      return () => {
-        cancelled = true;
-        window.removeEventListener('storage', onStorage);
-        try {
-          bc?.close();
-        } catch (_) {}
-      };
-    }
-  }, [roomId, code, role, broadcast, emitLocal]);
-
-  return { status, opponentOnline, onEvent, broadcast, setOpponentOnline };
+    const request = async (event?: unknown) => {
+      if (stopped) return;
+      if (busy) {
+        if (event) { queued = event; setPending(true); }
+        return;
+      }
+      busy = true;
+      if (event) setPending(true);
+      try {
+        const response = await fetch('/api/games/sync', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+          body: JSON.stringify({ code, version, event }),
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]),
+        });
+        const data = await response.json();
+        if (stopped) return;
+        if (data.state) { if (!queued) apply(data, !!event); }
+        else if (!response.ok) throw new Error(data.error || 'Unable to synchronize.');
+      } catch (cause) {
+        if (stopped) return;
+        setReady(false);
+        setStatus(navigator.onLine ? 'error' : 'disconnected');
+        setOpponentOnline(false);
+        setError(cause instanceof Error ? cause.message : 'Connection interrupted. Retrying…');
+        // Force the next snapshot to repair any unacknowledged local move.
+        initialized = false;
+      } finally {
+        busy = false;
+        if (!stopped) {
+          const next = queued;
+          queued = undefined;
+          if (next) void request(next);
+          else setPending(false);
+        }
+      }
+    };
+    requestRef.current = request;
+    const unsubscribe = useGameStore.subscribe((state, previous) => {
+      if (applying || !initialized || busy) return;
+      if (state.pieces !== previous.pieces && previous.turn === myRole && state.turn !== previous.turn) {
+        void request({ type: 'move-made', pieces: state.pieces });
+      }
+    });
+    void request();
+    const timer = setInterval(() => { void request(); }, 1000);
+    const wake = () => { if (!document.hidden) void request(); };
+    const offline = () => { setStatus('disconnected'); setReady(false); setOpponentOnline(false); };
+    window.addEventListener('online', wake);
+    window.addEventListener('offline', offline);
+    document.addEventListener('visibilitychange', wake);
+    return () => {
+      stopped = true;
+      controller.abort();
+      clearInterval(timer);
+      unsubscribe();
+      window.removeEventListener('online', wake);
+      window.removeEventListener('offline', offline);
+      document.removeEventListener('visibilitychange', wake);
+    };
+  }, [code]);
+  return { status, opponentOnline, role, ready, pending, error, retry, resign };
 }
