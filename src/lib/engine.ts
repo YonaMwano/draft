@@ -7,7 +7,7 @@ import Draughts, { GAME_VARIANTS } from 'dawikk-draughts';
 export type Square = number; // 0-49 for the 50 dark squares (International notation)
 
 export function createGame(fen?: string) {
-  const game = new (Draughts as any)({
+  const game = new Draughts({
     variant: GAME_VARIANTS.INTERNATIONAL,
     boardSize: 10,
   });
