@@ -4,8 +4,8 @@ import Link from 'next/link';
 import Board3D from '@/components/Board3D';
 import { useGameStore, CameraMode } from '@/store/gameStore';
 import { playMoveSound, playCaptureSound, playPromoteSound } from '@/lib/sound';
-import { useMultiplayer, type MpEvent } from '@/hooks/useMultiplayer';
-import { useEffect, useState, useCallback, useRef, Suspense, useMemo } from 'react';
+import { useMultiplayer } from '@/hooks/useMultiplayer';
+import { useEffect, useState, useCallback, useRef, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 
 function formatMs(ms: number) {
@@ -28,7 +28,8 @@ function GameRoomInner() {
   const roomId = searchParams.get('id') || roomCode.toLowerCase() || 'local';
 
   // Host / creator = white; joiner = black (pink pieces)
-  const myRole = roleParam === 'guest' || roleParam === 'black' ? 'black' : 'white';
+  const multiplayer = useMultiplayer(roomId, roomCode, roleParam);
+  const myRole = roomCode ? multiplayer.role : 'white';
   const isHost = myRole === 'white';
   const isOnlineRoom = !!roomCode;
 
@@ -47,25 +48,19 @@ function GameRoomInner() {
     resign,
     captureRequired,
     engine,
-    selectSquare,
-    soundEnabled,
   } = useGameStore();
 
-  const { status: connStatus, opponentOnline, onEvent, broadcast, setOpponentOnline } =
-    useMultiplayer(roomId, roomCode, myRole);
-
+  const { status: connStatus, opponentOnline, ready, pending, error, retry } = multiplayer;
   const [boardSize, setBoardSize] = useState(340);
   const [showResult, setShowResult] = useState(false);
-  const [liveMode, setLiveMode] = useState(false); // true when opponent connected → no bot
+  const liveMode = isOnlineRoom;
   const botThinking = useRef(false);
-  const lastMovePly = useRef(0);
-  const applyingRemote = useRef(false);
+
 
   // Start game once
   useEffect(() => {
-    newGame();
-    lastMovePly.current = 0;
-  }, [newGame]);
+    if (!isOnlineRoom) newGame();
+  }, [newGame, isOnlineRoom]);
 
   // Board size — rAF for smooth resize
   useEffect(() => {
@@ -87,10 +82,10 @@ function GameRoomInner() {
 
   // Clocks — light interval
   useEffect(() => {
-    if (status !== 'active') return;
+    if (status !== 'active' || (isOnlineRoom && !ready)) return;
     const id = setInterval(() => tick(), 250);
     return () => clearInterval(id);
-  }, [status, tick]);
+  }, [status, tick, isOnlineRoom, ready]);
 
   useEffect(() => {
     if (status === 'finished') {
@@ -99,102 +94,6 @@ function GameRoomInner() {
     }
     setShowResult(false);
   }, [status]);
-
-  // Listen for remote moves
-  useEffect(() => {
-    return onEvent((ev: MpEvent) => {
-      if (ev.type === 'player-joined' || ev.type === 'heartbeat') {
-        if (ev.role !== myRole) {
-          setOpponentOnline(true);
-          setLiveMode(true);
-        }
-        return;
-      }
-      if (ev.type !== 'move-made') return;
-      if (ev.by === myRole) return; // ignore echo of own move
-
-      setLiveMode(true);
-      setOpponentOnline(true);
-      applyingRemote.current = true;
-
-      // Sound for opponent move
-      if (soundEnabled !== false) {
-        if (ev.captures?.length) playCaptureSound();
-        else playMoveSound();
-      }
-
-      useGameStore.setState({
-        pieces: ev.pieces,
-        turn: ev.turn,
-        selected: null,
-        legalDestinations: [],
-        legalMoves: [],
-        whiteMs: ev.whiteMs,
-        blackMs: ev.blackMs,
-        status: (ev.status as any) || 'active',
-        winner: ev.winner ?? null,
-        resultReason: ev.resultReason ?? null,
-        lastTick: Date.now(),
-        captureRequired: false,
-      });
-
-      // Rebuild legal moves from engine if possible
-      const eng = useGameStore.getState().engine;
-      if (eng) {
-        eng.pieces = ev.pieces.map((p) => ({ ...p }));
-        eng.turn = ev.turn;
-        eng.winner = ev.winner ?? null;
-        eng.resultReason = ev.resultReason ?? null;
-        const moves = eng.legalMoves();
-        const maxCap = Math.max(0, ...moves.map((m) => m.captures.length));
-        useGameStore.setState({
-          legalMoves: moves,
-          captureRequired: maxCap > 0,
-          maxCaptures: maxCap,
-        });
-      }
-
-      lastMovePly.current = ev.ply || lastMovePly.current + 1;
-      applyingRemote.current = false;
-    });
-  }, [onEvent, myRole, soundEnabled, setOpponentOnline]);
-
-  // After local move, broadcast to opponent
-  const prevTurn = useRef(turn);
-  useEffect(() => {
-    if (applyingRemote.current) return;
-    if (!isOnlineRoom) return;
-    if (prevTurn.current === turn) return;
-    // Turn changed → a move was made locally
-    const s = useGameStore.getState();
-    if (!s.engine) {
-      prevTurn.current = turn;
-      return;
-    }
-    // Only broadcast if WE just moved (turn is now opponent's)
-    const weJustMoved =
-      (myRole === 'white' && turn === 'black') || (myRole === 'black' && turn === 'white');
-    if (weJustMoved || s.status === 'finished') {
-      lastMovePly.current += 1;
-      broadcast({
-        type: 'move-made',
-        from: 0,
-        path: [],
-        captures: [],
-        pieces: s.pieces,
-        turn: s.turn,
-        whiteMs: s.whiteMs,
-        blackMs: s.blackMs,
-        status: s.status,
-        winner: s.winner,
-        resultReason: s.resultReason,
-        ply: lastMovePly.current,
-        by: myRole,
-      });
-      if (liveMode || opponentOnline) setLiveMode(true);
-    }
-    prevTurn.current = turn;
-  }, [turn, status, isOnlineRoom, myRole, broadcast, liveMode, opponentOnline]);
 
   // Bot only when NOT live multiplayer (solo practice in room)
   useEffect(() => {
@@ -256,7 +155,7 @@ function GameRoomInner() {
 
   // I can move only on my color's turn
   const canMove =
-    status === 'active' &&
+    status === 'active' && (!isOnlineRoom || (ready && !pending)) &&
     ((myRole === 'white' && turn === 'white') || (myRole === 'black' && turn === 'black'));
 
   // For guest (black), flip board so pink pieces are at bottom
@@ -267,7 +166,7 @@ function GameRoomInner() {
 
   const connLabel =
     connStatus === 'connected'
-      ? opponentOnline || liveMode
+      ? opponentOnline
         ? 'Live'
         : 'Connected · waiting'
       : connStatus === 'connecting'
@@ -277,7 +176,7 @@ function GameRoomInner() {
       : 'Offline';
 
   const connColor =
-    connStatus === 'connected' && (opponentOnline || liveMode)
+    connStatus === 'connected' && opponentOnline
       ? '#3FB98A'
       : connStatus === 'connected'
       ? '#F5A524'
@@ -299,7 +198,7 @@ function GameRoomInner() {
           <p className="text-sm font-medium text-[#e8e6e3] truncate">
             {isOnlineRoom
               ? isHost
-                ? opponentOnline || liveMode
+                ? status !== 'idle'
                   ? 'Opponent (pink)'
                   : 'Waiting for opponent'
                 : 'Host (white)'
@@ -329,6 +228,21 @@ function GameRoomInner() {
           3D
         </button>
       </div>
+
+      {isOnlineRoom && (
+        <div className="mx-4 mb-2 rounded-xl border border-[#2a3340] bg-[#131A22] px-3 py-2 text-xs text-[#9ca3af]" role="status" aria-live="polite">
+          {error ? (
+            <div className="flex items-center justify-between gap-3">
+              <span>{error}</span>
+              <button type="button" onClick={retry} className="text-[#D4A24C] shrink-0">Retry now</button>
+            </div>
+          ) : !ready ? 'Connecting to room…' : status === 'idle'
+            ? 'Share the room code. The game starts when your friend joins.'
+            : pending ? 'Confirming move…' : opponentOnline
+            ? 'Both players connected · board syncs automatically'
+            : 'Opponent disconnected · waiting for them to reconnect'}
+        </div>
+      )}
 
       {/* You are playing as */}
       {isOnlineRoom && (
@@ -392,7 +306,7 @@ function GameRoomInner() {
                 ? 'Capture required — tap piece'
                 : 'Your turn — tap a piece'
               : liveMode || opponentOnline
-              ? 'Opponent thinking…'
+              ? 'Opponent’s turn'
               : isHost
               ? 'Bot thinking…'
               : 'Waiting for host…'}
@@ -461,25 +375,8 @@ function GameRoomInner() {
         <button
           type="button"
           className="action-btn"
-          onClick={() => {
-            newGame();
-            lastMovePly.current = 0;
-            broadcast({
-              type: 'move-made',
-              from: 0,
-              path: [],
-              captures: [],
-              pieces: useGameStore.getState().pieces,
-              turn: 'white',
-              whiteMs: 180000,
-              blackMs: 180000,
-              status: 'active',
-              winner: null,
-              resultReason: null,
-              ply: 0,
-              by: myRole,
-            });
-          }}
+          onClick={() => newGame()}
+          disabled={isOnlineRoom}
         >
           <span className="text-base">⟲</span>
           <span>New</span>
@@ -487,8 +384,8 @@ function GameRoomInner() {
         <button
           type="button"
           className="action-btn danger"
-          onClick={resign}
-          disabled={status !== 'active'}
+          onClick={isOnlineRoom ? multiplayer.resign : resign}
+          disabled={status !== 'active' || (isOnlineRoom && (!ready || pending))}
         >
           <span className="text-base">🏳</span>
           <span>Resign</span>
@@ -506,16 +403,11 @@ function GameRoomInner() {
               {resultReason?.replace(/_/g, ' ') || ''}
             </p>
             <div className="flex gap-3 mt-6">
-              <button
-                type="button"
-                onClick={() => {
-                  setShowResult(false);
-                  newGame();
-                }}
-                className="flex-1 h-12 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold"
-              >
-                Rematch
-              </button>
+              {isOnlineRoom ? (
+                <Link href="/play?mode=challenge" className="flex-1 h-12 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold flex items-center justify-center">New challenge</Link>
+              ) : (
+                <button type="button" onClick={() => { setShowResult(false); newGame(); }} className="flex-1 h-12 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold">Rematch</button>
+              )}
               <Link
                 href="/home"
                 className="flex-1 h-12 rounded-xl bg-[#1a222c] font-medium flex items-center justify-center text-[#e8e6e3]"
