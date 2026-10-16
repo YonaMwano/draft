@@ -4,9 +4,8 @@ import { Pool } from 'pg';
 // Prefer the Neon serverless driver for edge/serverless environments.
 // Fall back to classic pg Pool when running long-lived Node processes.
 
-const connectionString =
-  process.env.DATABASE_URL ||
-  'postgresql://neondb_owner:npg_iqvp0txLzR2D@ep-young-unit-b5ed0dyi-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) throw new Error('DATABASE_URL is required');
 
 // Serverless-friendly query helper (HTTP / WebSocket)
 export const sql = neon(connectionString);

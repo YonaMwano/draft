@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { pusherServer } from '@/lib/pusher';
+import { getPusherServer } from '@/lib/pusher-server';
 
 /** Relay multiplayer events via Pusher (works across devices). */
 export async function POST(req: Request) {
@@ -13,7 +13,7 @@ export async function POST(req: Request) {
 
     const channel = `game-${roomId}`;
     try {
-      await pusherServer.trigger(channel, event.type, event);
+      await getPusherServer().trigger(channel, event.type, event);
       return NextResponse.json({ ok: true, via: 'pusher' });
     } catch (e: any) {
       // Pusher not configured — client still has BroadcastChannel fallback
