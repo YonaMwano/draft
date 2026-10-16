@@ -1,0 +1,37 @@
+# Netlify configuration — Online Drafts (Next.js)
+# https://docs.netlify.com/frameworks/next-js/
+
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  NODE_VERSION = "20"
+  # Next.js plugin handles the rest
+  NETLIFY_NEXT_PLUGIN_SKIP = "false"
+
+# Official Next.js runtime on Netlify
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+# SPA-style fallback is handled by the Next plugin; keep headers tight
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+[[headers]]
+  for = "/_next/static/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# Environment variables — set these in Netlify UI → Site settings → Environment variables
+# Required:
+#   DATABASE_URL
+#   SESSION_SECRET
+#   NEXT_PUBLIC_PUSHER_KEY
+#   PUSHER_SECRET
+#   PUSHER_APP_ID
+#   NEXT_PUBLIC_PUSHER_CLUSTER

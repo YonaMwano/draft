@@ -1,0 +1,21 @@
+# =============================================================================
+# Online Drafts is a Next.js (Node.js) app — NOT a Python project.
+# Dependencies are managed by package.json / package-lock.json.
+#
+# For Netlify you only need:
+#   1. netlify.toml  (already in this repo)
+#   2. package.json  (npm install runs automatically on build)
+#
+# Optional: install the Netlify CLI locally
+#   npm install -g netlify-cli
+#   netlify login
+#   netlify init
+#   netlify deploy --prod
+#
+# Node version: 20.x (set in netlify.toml)
+# =============================================================================
+
+# If you still need a checklist of runtime services:
+# - Neon Postgres (DATABASE_URL)
+# - Pusher (NEXT_PUBLIC_PUSHER_KEY, PUSHER_SECRET, PUSHER_APP_ID, NEXT_PUBLIC_PUSHER_CLUSTER)
+# - Session secret (SESSION_SECRET) — long random string
