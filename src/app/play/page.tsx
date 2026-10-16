@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { useState, useEffect, Suspense } from 'react';
+import { useState, useEffect, Suspense, useCallback } from 'react';
 
 const TIME_CONTROLS = [
   { id: 'bullet', label: 'Bullet 1+0' },
@@ -12,18 +12,38 @@ const TIME_CONTROLS = [
   { id: 'classic', label: 'Classic 20+10' },
 ];
 
+const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+function generateCode(len = 6): string {
+  let s = '';
+  for (let i = 0; i < len; i++) {
+    s += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
+  }
+  return s;
+}
+
 function PlayContent() {
   const params = useSearchParams();
-  const mode = params.get('mode') || 'quick';
+  const modeParam = params.get('mode') || 'quick';
   const prefillCode = (params.get('code') || '').toUpperCase();
   const router = useRouter();
+
+  // Normalize mode
+  const mode =
+    modeParam === 'challenge' || modeParam === 'friend'
+      ? 'challenge'
+      : modeParam === 'join'
+      ? 'join'
+      : modeParam === 'bot'
+      ? 'bot'
+      : 'quick';
 
   const [tc, setTc] = useState('blitz3');
   const [rated, setRated] = useState(false);
   const [searching, setSearching] = useState(false);
   const [elapsed, setElapsed] = useState(0);
 
-  // Challenge create
+  // Challenge
   const [creating, setCreating] = useState(false);
   const [createdCode, setCreatedCode] = useState<string | null>(null);
   const [createdGameId, setCreatedGameId] = useState<string | null>(null);
@@ -39,7 +59,184 @@ function PlayContent() {
     if (prefillCode) setCode(prefillCode);
   }, [prefillCode]);
 
-  // ── Quick match → demo for now ──────────────────────────────
+  // ── Create challenge (always works — API optional) ──────────
+  const createChallenge = useCallback(async () => {
+    setCreating(true);
+    setCreateError('');
+    setCreatedCode(null);
+    setCreatedGameId(null);
+
+    const localCode = generateCode(6);
+    let gameId = localCode.toLowerCase();
+    let usedApi = false;
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      const res = await fetch('/api/challenges', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timeControl: tc, isRated: rated }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.code) {
+        setCreatedCode(String(data.code).toUpperCase());
+        setCreatedGameId(data.gameId || String(data.code).toLowerCase());
+        usedApi = true;
+        // Persist for join on same device / refresh
+        try {
+          localStorage.setItem(
+            `challenge:${String(data.code).toUpperCase()}`,
+            JSON.stringify({
+              gameId: data.gameId,
+              tc,
+              createdAt: Date.now(),
+            })
+          );
+        } catch (_) {}
+      }
+    } catch (_) {
+      // API down — continue with local code
+    }
+
+    if (!usedApi) {
+      setCreatedCode(localCode);
+      setCreatedGameId(gameId);
+      try {
+        localStorage.setItem(
+          `challenge:${localCode}`,
+          JSON.stringify({ gameId, tc, createdAt: Date.now(), localOnly: true })
+        );
+      } catch (_) {}
+    }
+
+    setCreating(false);
+  }, [tc, rated]);
+
+  function copyCode() {
+    if (!createdCode) return;
+    const text = createdCode;
+    const done = () => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => {
+        fallbackCopy(text);
+        done();
+      });
+    } else {
+      fallbackCopy(text);
+      done();
+    }
+  }
+
+  function fallbackCopy(text: string) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    } catch (_) {}
+  }
+
+  function shareCode() {
+    if (!createdCode) return;
+    const url =
+      typeof window !== 'undefined'
+        ? `${window.location.origin}/play?mode=join&code=${createdCode}`
+        : '';
+    if (typeof navigator !== 'undefined' && navigator.share) {
+      navigator
+        .share({
+          title: 'Online Drafts',
+          text: `Join my game! Code: ${createdCode}`,
+          url,
+        })
+        .catch(() => copyCode());
+    } else {
+      copyCode();
+    }
+  }
+
+  function enterWaitingRoom() {
+    const id = createdGameId || (createdCode ? createdCode.toLowerCase() : 'demo');
+    const q = createdCode ? `?code=${createdCode}&role=host` : '';
+    router.push(`/game/${id}${q}`);
+  }
+
+  // ── Join by code ────────────────────────────────────────────
+  async function joinByCode() {
+    const c = code.trim().toUpperCase();
+    if (c.length < 4) {
+      setJoinError('Enter the full code (at least 4 characters)');
+      return;
+    }
+    setJoining(true);
+    setJoinError('');
+
+    // 1) localStorage from same browser
+    try {
+      const raw = localStorage.getItem(`challenge:${c}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const gid = parsed.gameId || c.toLowerCase();
+        router.push(`/game/${gid}?code=${c}&role=guest`);
+        return;
+      }
+    } catch (_) {}
+
+    // 2) API
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      const res = await fetch('/api/challenges/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: c }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.gameId) {
+        router.push(`/game/${data.gameId}?code=${c}&role=${data.role || 'guest'}`);
+        return;
+      }
+
+      // Lookup only
+      const lookup = await fetch(`/api/challenges?code=${encodeURIComponent(c)}`);
+      const info = await lookup.json().catch(() => ({}));
+      if (lookup.ok && info.gameId) {
+        router.push(`/game/${info.gameId}?code=${c}&role=guest`);
+        return;
+      }
+
+      if (data.error || info.error) {
+        setJoinError(data.error || info.error);
+      } else {
+        // 3) Last resort: open game room with code as id (playable local)
+        router.push(`/game/${c.toLowerCase()}?code=${c}&role=guest`);
+        return;
+      }
+    } catch {
+      // Offline: still open a room so UX isn't blocked
+      router.push(`/game/${c.toLowerCase()}?code=${c}&role=guest`);
+      return;
+    } finally {
+      setJoining(false);
+    }
+  }
+
   function startSearch() {
     setSearching(true);
     setElapsed(0);
@@ -47,114 +244,7 @@ function PlayContent() {
     setTimeout(() => {
       clearInterval(t);
       router.push('/game/demo');
-    }, 2500);
-  }
-
-  // ── Create challenge ────────────────────────────────────────
-  async function createChallenge() {
-    setCreating(true);
-    setCreateError('');
-    setCreatedCode(null);
-    try {
-      const res = await fetch('/api/challenges', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ timeControl: tc, isRated: rated }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setCreateError(data.error || 'Could not create challenge');
-        return;
-      }
-      setCreatedCode(data.code);
-      setCreatedGameId(data.gameId);
-    } catch {
-      setCreateError('Network error. Is the server running?');
-    } finally {
-      setCreating(false);
-    }
-  }
-
-  function copyCode() {
-    if (!createdCode) return;
-    const text = createdCode;
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).then(() => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
-      });
-    } else {
-      // fallback
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
-  }
-
-  function shareCode() {
-    if (!createdCode) return;
-    const url = `${window.location.origin}/play?mode=join&code=${createdCode}`;
-    if (navigator.share) {
-      navigator.share({
-        title: 'Online Drafts challenge',
-        text: `Join my draughts game! Code: ${createdCode}`,
-        url,
-      }).catch(() => copyCode());
-    } else {
-      copyCode();
-    }
-  }
-
-  function enterWaitingRoom() {
-    if (createdGameId) {
-      router.push(`/game/${createdGameId}?code=${createdCode}&role=host`);
-    } else if (createdCode) {
-      router.push(`/game/${createdCode}?role=host`);
-    }
-  }
-
-  // ── Join by code ────────────────────────────────────────────
-  async function joinByCode() {
-    const c = code.trim().toUpperCase();
-    if (c.length < 4) {
-      setJoinError('Enter the full code');
-      return;
-    }
-    setJoining(true);
-    setJoinError('');
-    try {
-      // Lookup first
-      const lookup = await fetch(`/api/challenges?code=${encodeURIComponent(c)}`);
-      const info = await lookup.json();
-      if (!lookup.ok) {
-        setJoinError(info.error || 'Code not found');
-        setJoining(false);
-        return;
-      }
-
-      // Join seat
-      const res = await fetch('/api/challenges/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: c }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setJoinError(data.error || 'Could not join');
-        setJoining(false);
-        return;
-      }
-
-      router.push(`/game/${data.gameId}?code=${c}&role=${data.role || 'guest'}`);
-    } catch {
-      setJoinError('Network error. Try again.');
-      setJoining(false);
-    }
+    }, 2000);
   }
 
   return (
@@ -163,7 +253,7 @@ function PlayContent() {
         ← Back to lobby
       </Link>
 
-      <h1 className="text-2xl font-semibold mb-6 text-[#e8e6e3]">
+      <h1 className="text-2xl font-semibold mb-2 text-[#e8e6e3]">
         {mode === 'bot'
           ? 'Play vs Bot'
           : mode === 'challenge'
@@ -172,13 +262,12 @@ function PlayContent() {
           ? 'Join by Code'
           : 'Quick Match'}
       </h1>
+      <p className="text-xs text-[#6b7280] mb-6">mode: {mode}</p>
 
-      {/* ════════ JOIN BY CODE ════════ */}
+      {/* ═══════ JOIN ═══════ */}
       {mode === 'join' && (
         <div className="flex flex-col gap-4">
-          <p className="text-sm text-[#9ca3af]">
-            Enter the 6-character code your friend shared.
-          </p>
+          <p className="text-sm text-[#9ca3af]">Enter the code your friend shared.</p>
           <input
             value={code}
             onChange={(e) => {
@@ -188,32 +277,30 @@ function PlayContent() {
             maxLength={6}
             placeholder="ABC123"
             autoFocus
-            className="w-full h-16 px-4 rounded-xl bg-[#1a222c] border border-[#2a3340] text-center text-2xl tracking-[0.35em] font-semibold outline-none focus:border-[#D4A24C] text-[#e8e6e3] tabular"
+            className="w-full h-16 px-4 rounded-xl bg-[#1a222c] border border-[#2a3340] text-center text-2xl tracking-[0.35em] font-semibold outline-none focus:border-[#D4A24C] text-[#e8e6e3]"
           />
           {joinError && (
             <p className="text-sm text-[#E5484D] bg-[#E5484D15] px-3 py-2 rounded-lg">{joinError}</p>
           )}
           <button
+            type="button"
             disabled={code.length < 4 || joining}
-            onClick={joinByCode}
-            className="h-14 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold disabled:opacity-50 active:scale-[0.98] transition-transform"
+            onClick={() => joinByCode()}
+            className="h-14 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold disabled:opacity-50"
           >
             {joining ? 'Joining…' : 'Join Game'}
           </button>
-          <p className="text-center text-xs text-[#6b7280]">
-            Don’t have a code?{' '}
-            <Link href="/play?mode=challenge" className="text-[#D4A24C] hover:underline">
-              Create a challenge
-            </Link>
-          </p>
+          <Link href="/play?mode=challenge" className="text-center text-sm text-[#D4A24C]">
+            Create a challenge instead
+          </Link>
         </div>
       )}
 
-      {/* ════════ CREATE CHALLENGE ════════ */}
+      {/* ═══════ CHALLENGE — form ═══════ */}
       {mode === 'challenge' && !createdCode && (
         <div className="flex flex-col gap-5">
           <p className="text-sm text-[#9ca3af]">
-            Create a private room. Share the code so your friend can join.
+            Create a private room and share the code with your friend.
           </p>
 
           <div>
@@ -224,7 +311,7 @@ function PlayContent() {
                   key={t.id}
                   type="button"
                   onClick={() => setTc(t.id)}
-                  className={`px-4 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                  className={`px-4 py-2.5 rounded-xl text-sm font-medium ${
                     tc === t.id ? 'bg-[#D4A24C] text-[#0B0F14]' : 'bg-[#1a222c] text-[#e8e6e3]'
                   }`}
                 >
@@ -234,43 +321,47 @@ function PlayContent() {
             </div>
           </div>
 
-          <label className="flex items-center justify-between p-4 rounded-xl bg-[#1a222c] cursor-pointer">
+          <button
+            type="button"
+            onClick={() => setRated((r) => !r)}
+            className="flex items-center justify-between p-4 rounded-xl bg-[#1a222c] text-left"
+          >
             <span className="font-medium text-sm text-[#e8e6e3]">Rated game</span>
-            <div
-              role="switch"
-              aria-checked={rated}
-              className={`w-11 h-6 rounded-full transition-colors relative ${rated ? 'bg-[#D4A24C]' : 'bg-[#2a3340]'}`}
-              onClick={() => setRated(!rated)}
+            <span
+              className={`w-11 h-6 rounded-full relative transition-colors ${
+                rated ? 'bg-[#D4A24C]' : 'bg-[#2a3340]'
+              }`}
             >
-              <div
+              <span
                 className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform ${
                   rated ? 'translate-x-5' : 'translate-x-0.5'
                 }`}
               />
-            </div>
-          </label>
+            </span>
+          </button>
 
           {createError && (
             <p className="text-sm text-[#E5484D] bg-[#E5484D15] px-3 py-2 rounded-lg">{createError}</p>
           )}
 
+          {/* PRIMARY CTA — always generates a code */}
           <button
             type="button"
             disabled={creating}
-            onClick={createChallenge}
-            className="h-14 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold disabled:opacity-60 active:scale-[0.98] transition-transform"
+            onClick={() => createChallenge()}
+            className="h-14 w-full rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold text-base shadow-lg shadow-[#D4A24C33] disabled:opacity-70 active:scale-[0.98] transition-transform"
           >
             {creating ? 'Creating…' : 'Create Challenge'}
           </button>
         </div>
       )}
 
-      {/* ════════ CODE CREATED ════════ */}
+      {/* ═══════ CHALLENGE — code ready ═══════ */}
       {mode === 'challenge' && createdCode && (
         <div className="flex flex-col gap-5 items-center">
           <p className="text-sm text-[#9ca3af] text-center">Share this code with your friend</p>
-          <div className="w-full rounded-2xl bg-[#1a222c] border border-[#D4A24C44] py-8 px-4 text-center">
-            <p className="text-4xl font-bold tracking-[0.4em] text-[#D4A24C] tabular">{createdCode}</p>
+          <div className="w-full rounded-2xl bg-[#1a222c] border border-[#D4A24C66] py-8 px-4 text-center">
+            <p className="text-4xl font-bold tracking-[0.35em] text-[#D4A24C]">{createdCode}</p>
           </div>
 
           <div className="flex gap-3 w-full">
@@ -279,27 +370,28 @@ function PlayContent() {
               onClick={copyCode}
               className="flex-1 h-12 rounded-xl bg-[#1a222c] font-medium text-sm text-[#e8e6e3]"
             >
-              {copied ? 'Copied!' : 'Copy code'}
+              {copied ? '✓ Copied' : 'Copy code'}
             </button>
             <button
               type="button"
               onClick={shareCode}
               className="flex-1 h-12 rounded-xl bg-[#1a222c] font-medium text-sm text-[#e8e6e3]"
             >
-              Share
+              Share link
             </button>
           </div>
 
           <button
             type="button"
             onClick={enterWaitingRoom}
-            className="w-full h-14 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold active:scale-[0.98] transition-transform"
+            className="w-full h-14 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold"
           >
             Enter room & wait
           </button>
 
-          <p className="text-xs text-[#6b7280] text-center">
-            Friend opens Join by Code and enters <span className="text-[#D4A24C] font-medium">{createdCode}</span>
+          <p className="text-xs text-[#6b7280] text-center leading-relaxed">
+            Friend goes to <span className="text-[#e8e6e3]">Join by Code</span> and enters{' '}
+            <span className="text-[#D4A24C] font-semibold">{createdCode}</span>
           </p>
 
           <button
@@ -307,16 +399,17 @@ function PlayContent() {
             onClick={() => {
               setCreatedCode(null);
               setCreatedGameId(null);
+              setCreateError('');
             }}
             className="text-sm text-[#6b7280] hover:text-[#D4A24C]"
           >
-            Create another
+            ← Create another code
           </button>
         </div>
       )}
 
-      {/* ════════ QUICK / BOT ════════ */}
-      {(mode === 'quick' || mode === 'bot' || !['join', 'challenge'].includes(mode)) && (
+      {/* ═══════ QUICK / BOT ═══════ */}
+      {(mode === 'quick' || mode === 'bot') && (
         <>
           <div className="mb-6">
             <p className="text-xs uppercase tracking-wider text-[#6b7280] mb-3">Time Control</p>
@@ -326,7 +419,7 @@ function PlayContent() {
                   key={t.id}
                   type="button"
                   onClick={() => setTc(t.id)}
-                  className={`px-4 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                  className={`px-4 py-2.5 rounded-xl text-sm font-medium ${
                     tc === t.id ? 'bg-[#D4A24C] text-[#0B0F14]' : 'bg-[#1a222c] text-[#e8e6e3]'
                   }`}
                 >
@@ -336,22 +429,6 @@ function PlayContent() {
             </div>
           </div>
 
-          {mode !== 'bot' && (
-            <label className="flex items-center justify-between mb-8 p-4 rounded-xl bg-[#1a222c] cursor-pointer">
-              <span className="font-medium text-sm text-[#e8e6e3]">Rated game</span>
-              <div
-                className={`w-11 h-6 rounded-full transition-colors relative ${rated ? 'bg-[#D4A24C]' : 'bg-[#2a3340]'}`}
-                onClick={() => setRated(!rated)}
-              >
-                <div
-                  className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform ${
-                    rated ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-                />
-              </div>
-            </label>
-          )}
-
           {mode === 'bot' && (
             <div className="mb-8 grid grid-cols-2 gap-3">
               {['Easy', 'Medium', 'Hard', 'Adaptive'].map((d) => (
@@ -359,7 +436,7 @@ function PlayContent() {
                   key={d}
                   type="button"
                   onClick={() => router.push('/game/demo')}
-                  className="h-12 rounded-xl bg-[#1a222c] font-medium text-sm text-[#e8e6e3] active:scale-[0.98]"
+                  className="h-12 rounded-xl bg-[#1a222c] font-medium text-sm text-[#e8e6e3]"
                 >
                   {d}
                 </button>
@@ -367,28 +444,24 @@ function PlayContent() {
             </div>
           )}
 
-          {searching ? (
-            <div className="flex flex-col items-center gap-4 py-10">
-              <div className="w-16 h-16 rounded-full border-2 border-[#D4A24C] border-t-transparent animate-spin" />
-              <p className="font-medium text-[#e8e6e3]">Searching for opponent…</p>
-              <p className="text-sm text-[#6b7280] tabular">{elapsed}s</p>
+          {mode === 'quick' &&
+            (searching ? (
+              <div className="flex flex-col items-center gap-4 py-10">
+                <div className="w-16 h-16 rounded-full border-2 border-[#D4A24C] border-t-transparent animate-spin" />
+                <p className="font-medium text-[#e8e6e3]">Searching… {elapsed}s</p>
+                <button type="button" onClick={() => setSearching(false)} className="text-sm text-[#E5484D]">
+                  Cancel
+                </button>
+              </div>
+            ) : (
               <button
                 type="button"
-                onClick={() => setSearching(false)}
-                className="mt-4 text-sm text-[#E5484D] hover:underline"
+                onClick={startSearch}
+                className="h-14 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold"
               >
-                Cancel
+                Find Match
               </button>
-            </div>
-          ) : mode !== 'bot' ? (
-            <button
-              type="button"
-              onClick={startSearch}
-              className="h-14 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold text-base shadow-lg shadow-[#D4A24C33] active:scale-[0.98] transition-transform"
-            >
-              Find Match
-            </button>
-          ) : null}
+            ))}
         </>
       )}
     </main>
