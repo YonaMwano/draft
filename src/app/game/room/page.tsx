@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { useOnlineRoom } from '@/hooks/useOnlineRoom';
 import Board3D from '@/components/Board3D';
 import { useGameStore, CameraMode } from '@/store/gameStore';
 import { playMoveSound, playCaptureSound, playPromoteSound } from '@/lib/sound';
@@ -23,9 +24,10 @@ function clockColor(ms: number, isTurn: boolean) {
 function GameRoomInner() {
   const searchParams = useSearchParams();
   const roomCode = searchParams.get('code') || '';
-  const role = searchParams.get('role') || 'host';
   const roomId = searchParams.get('id') || '';
 
+  const online = !!(roomId || roomCode);
+  const { connection, waiting, busy, initialMs, resignOnline } = useOnlineRoom(roomId, online);
   const store = useGameStore();
   const {
     newGame,
@@ -43,6 +45,7 @@ function GameRoomInner() {
     captureRequired,
     maxCaptures,
     engine,
+    myColor,
   } = store;
 
   const [boardSize, setBoardSize] = useState(340);
@@ -50,8 +53,8 @@ function GameRoomInner() {
   const botThinking = useRef(false);
 
   useEffect(() => {
-    newGame();
-  }, [newGame]);
+    if (!online) newGame();
+  }, [newGame, online]);
 
   useEffect(() => {
     const update = () => {
@@ -64,10 +67,10 @@ function GameRoomInner() {
   }, []);
 
   useEffect(() => {
-    if (status !== 'active') return;
+    if (online || status !== 'active') return;
     const id = setInterval(() => tick(), 200);
     return () => clearInterval(id);
-  }, [status, tick]);
+  }, [status, tick, online]);
 
   useEffect(() => {
     if (status === 'finished') {
@@ -79,7 +82,7 @@ function GameRoomInner() {
 
   // Simple bot: when it's black's turn, pick a random legal move after a short delay
   useEffect(() => {
-    if (status !== 'active' || turn !== 'black' || !engine || botThinking.current) return;
+    if (online || status !== 'active' || turn !== 'black' || !engine || botThinking.current) return;
 
     botThinking.current = true;
     const delay = 600 + Math.random() * 900;
@@ -128,7 +131,7 @@ function GameRoomInner() {
       clearTimeout(t);
       botThinking.current = false;
     };
-  }, [turn, status, engine]);
+  }, [turn, status, engine, online]);
 
   const cycleCamera = useCallback(() => {
     const modes: CameraMode[] = ['tilted', 'immersive', 'tactical', 'topdown'];
@@ -136,8 +139,11 @@ function GameRoomInner() {
     setCamera(modes[(idx + 1) % modes.length]);
   }, [camera, setCamera]);
 
-  const whiteCaptured = 20 - pieces.filter((p) => p.color === 'black').length;
-  const blackCaptured = 20 - pieces.filter((p) => p.color === 'white').length;
+  const opponentMs = online && myColor === 'black' ? whiteMs : blackMs;
+  const ownMs = online && myColor === 'black' ? blackMs : whiteMs;
+  const ownTurn = turn === (online ? myColor : 'white');
+  const whiteCaptured = 20 - pieces.filter((p) => p.color === (online ? myColor : 'white')).length;
+  const blackCaptured = 20 - pieces.filter((p) => p.color !== (online ? myColor : 'white')).length;
 
   return (
     <main className="min-h-dvh flex flex-col max-w-lg mx-auto bg-[#0B0F14] relative overflow-hidden">
@@ -151,7 +157,7 @@ function GameRoomInner() {
         </Link>
         <div className="text-center">
           <p className="text-sm font-medium text-[#e8e6e3]">
-            {roomCode ? (role === 'host' || role === 'white' ? 'Waiting for opponent' : 'Friend') : 'Black (Bot)'}
+            {online ? (waiting ? 'Waiting for opponent' : `You play ${myColor === 'white' ? 'white' : 'pink'}`) : 'Pink (Bot)'}
           </p>
           <p className="text-xs text-[#6b7280] flex items-center justify-center gap-1.5">
             {roomCode ? (
@@ -169,6 +175,7 @@ function GameRoomInner() {
         </button>
       </div>
 
+      {online && <p role="status" aria-live="polite" className="text-center text-xs px-3 pb-2 text-[#9ca3af]">{connection}{waiting && connection === 'Connected' ? ' · Share your code to start' : ''}</p>}
       {/* Opponent clock */}
       <div className="px-4 shrink-0">
         <div className="flex items-center justify-between mb-1">
@@ -177,22 +184,22 @@ function GameRoomInner() {
               <div
                 key={i}
                 className="w-2.5 h-2.5 rounded-full"
-                style={{ background: 'linear-gradient(145deg, #f8f4ec, #d4c4a8)' }}
+                style={{ background: myColor === 'white' ? '#f0e6d4' : '#e84393' }}
               />
             ))}
             {whiteCaptured > 10 && (
               <span className="text-[10px] text-[#9ca3af] ml-0.5">+{whiteCaptured - 10}</span>
             )}
           </div>
-          <p className="text-sm tabular font-medium" style={{ color: clockColor(blackMs, turn === 'black') }}>
-            {formatMs(blackMs)}
+          <p className="text-sm tabular font-medium" style={{ color: clockColor(opponentMs, !ownTurn) }}>
+            {formatMs(opponentMs)}
           </p>
         </div>
         <div className="clock-bar">
           <div
             style={{
-              width: `${Math.min(100, (blackMs / 180000) * 100)}%`,
-              background: clockColor(blackMs, turn === 'black'),
+              width: `${Math.min(100, (opponentMs / initialMs) * 100)}%`,
+              background: clockColor(opponentMs, !ownTurn),
               transition: 'width 0.2s linear',
             }}
           />
@@ -203,8 +210,8 @@ function GameRoomInner() {
       <div className="text-center py-1.5 shrink-0 h-7">
         {status === 'active' && (
           <p className="text-xs font-medium" style={{ color: turn === 'white' ? '#D4A24C' : '#9ca3af' }}>
-            {turn === 'white' ? 'Your turn — tap a piece' : 'Bot is thinking…'}
-            {captureRequired && turn === 'white' && (
+            {online ? (turn === myColor ? 'Your turn — tap a piece' : 'Opponent’s turn') : (turn === 'white' ? 'Your turn — tap a piece' : 'Bot is thinking…')}
+            {captureRequired && turn === myColor && (
               <span className="ml-2 text-[#F5A524]">· Capture required</span>
             )}
           </p>
@@ -213,21 +220,21 @@ function GameRoomInner() {
 
       {/* Board */}
       <div className="flex-1 flex items-center justify-center px-2 min-h-0">
-        <Board3D boardSize={boardSize} interactive={status === 'active' && turn === 'white'} />
+        <Board3D boardSize={boardSize} interactive={status === 'active' && turn === (online ? myColor : 'white') && (!online || (connection === 'Connected' && !busy))} />
       </div>
 
       {/* Your clock */}
       <div className="px-4 shrink-0 mt-1">
         <div className="flex items-center justify-between mb-1">
-          <p className="text-sm tabular font-medium" style={{ color: clockColor(whiteMs, turn === 'white') }}>
-            {formatMs(whiteMs)}
+          <p className="text-sm tabular font-medium" style={{ color: clockColor(ownMs, ownTurn) }}>
+            {formatMs(ownMs)}
           </p>
           <div className="flex gap-0.5 items-center">
             {Array.from({ length: Math.min(blackCaptured, 10) }).map((_, i) => (
               <div
                 key={i}
                 className="w-2.5 h-2.5 rounded-full"
-                style={{ background: 'linear-gradient(145deg, #3a3a3a, #1a1a1a)' }}
+                style={{ background: myColor === 'white' ? '#e84393' : '#f0e6d4' }}
               />
             ))}
             {blackCaptured > 10 && (
@@ -238,8 +245,8 @@ function GameRoomInner() {
         <div className="clock-bar">
           <div
             style={{
-              width: `${Math.min(100, (whiteMs / 180000) * 100)}%`,
-              background: clockColor(whiteMs, turn === 'white'),
+              width: `${Math.min(100, (ownMs / initialMs) * 100)}%`,
+              background: clockColor(ownMs, ownTurn),
               transition: 'width 0.2s linear',
               boxShadow: turn === 'white' ? '0 0 8px #D4A24C55' : undefined,
             }}
@@ -253,7 +260,7 @@ function GameRoomInner() {
           <span className="text-base">↻</span>
           <span>3D</span>
         </button>
-        <button className="action-btn" onClick={() => newGame()}>
+        <button className="action-btn" onClick={() => newGame()} disabled={online}>
           <span className="text-base">⟲</span>
           <span>New</span>
         </button>
@@ -261,7 +268,7 @@ function GameRoomInner() {
           <span className="text-base">☰</span>
           <span>Moves</span>
         </button>
-        <button className="action-btn danger" onClick={resign} disabled={status !== 'active'}>
+        <button className="action-btn danger" onClick={online ? resignOnline : resign} disabled={busy || status !== 'active'}>
           <span className="text-base">🏳</span>
           <span>Resign</span>
         </button>
@@ -273,7 +280,7 @@ function GameRoomInner() {
           <div className="w-full max-w-lg rounded-t-3xl bg-[#131A22] border-t border-[#2a3340] p-6 pb-10">
             <div className="w-10 h-1 rounded-full bg-[#2a3340] mx-auto mb-5" />
             <h2 className="text-2xl font-semibold text-center text-[#e8e6e3]">
-              {winner === 'white' ? 'Victory!' : winner === 'black' ? 'Defeat' : 'Draw'}
+              {winner === 'draw' ? 'Draw' : winner === myColor ? 'Victory!' : 'Defeat'}
             </h2>
             <p className="text-center text-sm text-[#9ca3af] mt-1 capitalize">
               {resultReason?.replace(/_/g, ' ') || ''}
@@ -287,26 +294,27 @@ function GameRoomInner() {
               <div className="rounded-xl bg-[#1a222c] p-3 text-center">
                 <p className="text-xs text-[#6b7280]">Left</p>
                 <p className="text-lg font-semibold tabular mt-0.5">
-                  {pieces.filter((p) => p.color === 'white').length}
+                  {pieces.filter((p) => p.color === myColor).length}
                 </p>
               </div>
               <div className="rounded-xl bg-[#1a222c] p-3 text-center">
                 <p className="text-xs text-[#6b7280]">Kings</p>
                 <p className="text-lg font-semibold tabular mt-0.5">
-                  {pieces.filter((p) => p.color === 'white' && p.isKing).length}
+                  {pieces.filter((p) => p.color === myColor && p.isKing).length}
                 </p>
               </div>
             </div>
 
             <div className="flex gap-3 mt-6">
               <button
+                disabled={online}
                 onClick={() => {
                   setShowResult(false);
                   newGame();
                 }}
                 className="flex-1 h-12 rounded-xl bg-[#D4A24C] text-[#0B0F14] font-semibold"
               >
-                Rematch
+                {online ? 'Game finished' : 'Rematch'}
               </button>
               <Link
                 href="/home"

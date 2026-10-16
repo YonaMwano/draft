@@ -12,16 +12,6 @@ const TIME_CONTROLS = [
   { id: 'classic', label: 'Classic 20+10' },
 ];
 
-const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-
-function generateCode(len = 6): string {
-  let s = '';
-  for (let i = 0; i < len; i++) {
-    s += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
-  }
-  return s;
-}
-
 function PlayContent() {
   const params = useSearchParams();
   const modeParam = params.get('mode') || 'quick';
@@ -59,59 +49,24 @@ function PlayContent() {
     if (prefillCode) setCode(prefillCode);
   }, [prefillCode]);
 
-  // ── Create challenge (always works — API optional) ──────────
+  // ── Create an online challenge ──────────
   const createChallenge = useCallback(async () => {
     setCreating(true);
     setCreateError('');
     setCreatedCode(null);
     setCreatedGameId(null);
 
-    const localCode = generateCode(6);
-    let gameId = localCode.toLowerCase();
-    let usedApi = false;
-
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
-
       const res = await fetch('/api/challenges', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ timeControl: tc, isRated: rated }),
-        signal: controller.signal,
       });
-      clearTimeout(timeout);
-
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && data.code) {
-        setCreatedCode(String(data.code).toUpperCase());
-        setCreatedGameId(data.gameId || String(data.code).toLowerCase());
-        usedApi = true;
-        // Persist for join on same device / refresh
-        try {
-          localStorage.setItem(
-            `challenge:${String(data.code).toUpperCase()}`,
-            JSON.stringify({
-              gameId: data.gameId,
-              tc,
-              createdAt: Date.now(),
-            })
-          );
-        } catch (_) {}
-      }
-    } catch (_) {
-      // API down — continue with local code
-    }
-
-    if (!usedApi) {
-      setCreatedCode(localCode);
-      setCreatedGameId(gameId);
-      try {
-        localStorage.setItem(
-          `challenge:${localCode}`,
-          JSON.stringify({ gameId, tc, createdAt: Date.now(), localOnly: true })
-        );
-      } catch (_) {}
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Unable to create room');
+      setCreatedCode(data.code);
+      setCreatedGameId(data.gameId);
+    } catch (error) {
+      setCreateError(error instanceof Error ? error.message : 'Unable to connect. Please retry.');
     }
 
     setCreating(false);
@@ -184,55 +139,16 @@ function PlayContent() {
     setJoining(true);
     setJoinError('');
 
-    // 1) localStorage from same browser
     try {
-      const raw = localStorage.getItem(`challenge:${c}`);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        const gid = parsed.gameId || c.toLowerCase();
-        router.push(`/game/room?id=${encodeURIComponent(gid)}&code=${encodeURIComponent(c)}&role=guest`);
-        return;
-      }
-    } catch (_) {}
-
-    // 2) API
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
-
       const res = await fetch('/api/challenges/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code: c }),
-        signal: controller.signal,
       });
-      clearTimeout(timeout);
-
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && data.gameId) {
-        router.push(`/game/room?id=${encodeURIComponent(data.gameId)}&code=${encodeURIComponent(c)}&role=${encodeURIComponent(data.role || 'guest')}`);
-        return;
-      }
-
-      // Lookup only
-      const lookup = await fetch(`/api/challenges?code=${encodeURIComponent(c)}`);
-      const info = await lookup.json().catch(() => ({}));
-      if (lookup.ok && info.gameId) {
-        router.push(`/game/room?id=${encodeURIComponent(info.gameId)}&code=${encodeURIComponent(c)}&role=guest`);
-        return;
-      }
-
-      if (data.error || info.error) {
-        setJoinError(data.error || info.error);
-      } else {
-        // 3) Last resort: open game room with code as id (playable local)
-        router.push(`/game/room?id=${encodeURIComponent(c.toLowerCase())}&code=${encodeURIComponent(c)}&role=guest`);
-        return;
-      }
-    } catch {
-      // Offline: still open a room so UX isn't blocked
-      router.push(`/game/room?id=${encodeURIComponent(c.toLowerCase())}&code=${encodeURIComponent(c)}&role=guest`);
-      return;
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Unable to join room');
+      router.push(`/game/room?id=${encodeURIComponent(data.gameId)}&code=${encodeURIComponent(c)}`);
+    } catch (error) {
+      setJoinError(error instanceof Error ? error.message : 'Unable to connect. Please retry.');
     } finally {
       setJoining(false);
     }
