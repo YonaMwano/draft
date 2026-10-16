@@ -169,8 +169,9 @@ function PlayContent() {
 
   function enterWaitingRoom() {
     const id = createdGameId || (createdCode ? createdCode.toLowerCase() : 'demo');
-    const q = createdCode ? `?code=${createdCode}&role=host` : '';
-    router.push(`/game/${id}${q}`);
+    const code = createdCode || '';
+    // Always use static /game/room — works on Netlify (no dynamic [id] 404)
+    router.push(`/game/room?id=${encodeURIComponent(id)}&code=${encodeURIComponent(code)}&role=host`);
   }
 
   // ── Join by code ────────────────────────────────────────────
@@ -189,7 +190,7 @@ function PlayContent() {
       if (raw) {
         const parsed = JSON.parse(raw);
         const gid = parsed.gameId || c.toLowerCase();
-        router.push(`/game/${gid}?code=${c}&role=guest`);
+        router.push(`/game/room?id=${encodeURIComponent(gid)}&code=${encodeURIComponent(c)}&role=guest`);
         return;
       }
     } catch (_) {}
@@ -209,7 +210,7 @@ function PlayContent() {
 
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.gameId) {
-        router.push(`/game/${data.gameId}?code=${c}&role=${data.role || 'guest'}`);
+        router.push(`/game/room?id=${encodeURIComponent(data.gameId)}&code=${encodeURIComponent(c)}&role=${encodeURIComponent(data.role || 'guest')}`);
         return;
       }
 
@@ -217,7 +218,7 @@ function PlayContent() {
       const lookup = await fetch(`/api/challenges?code=${encodeURIComponent(c)}`);
       const info = await lookup.json().catch(() => ({}));
       if (lookup.ok && info.gameId) {
-        router.push(`/game/${info.gameId}?code=${c}&role=guest`);
+        router.push(`/game/room?id=${encodeURIComponent(info.gameId)}&code=${encodeURIComponent(c)}&role=guest`);
         return;
       }
 
@@ -225,12 +226,12 @@ function PlayContent() {
         setJoinError(data.error || info.error);
       } else {
         // 3) Last resort: open game room with code as id (playable local)
-        router.push(`/game/${c.toLowerCase()}?code=${c}&role=guest`);
+        router.push(`/game/room?id=${encodeURIComponent(c.toLowerCase())}&code=${encodeURIComponent(c)}&role=guest`);
         return;
       }
     } catch {
       // Offline: still open a room so UX isn't blocked
-      router.push(`/game/${c.toLowerCase()}?code=${c}&role=guest`);
+      router.push(`/game/room?id=${encodeURIComponent(c.toLowerCase())}&code=${encodeURIComponent(c)}&role=guest`);
       return;
     } finally {
       setJoining(false);
