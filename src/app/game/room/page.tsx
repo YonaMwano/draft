@@ -4,7 +4,8 @@ import Link from 'next/link';
 import Board3D from '@/components/Board3D';
 import { useGameStore, CameraMode } from '@/store/gameStore';
 import { playMoveSound, playCaptureSound, playPromoteSound } from '@/lib/sound';
-import { useEffect, useState, useCallback, useRef, Suspense } from 'react';
+import { useMultiplayer, type MpEvent } from '@/hooks/useMultiplayer';
+import { useEffect, useState, useCallback, useRef, Suspense, useMemo } from 'react';
 import { useSearchParams } from 'next/navigation';
 
 function formatMs(ms: number) {
@@ -22,11 +23,15 @@ function clockColor(ms: number, isTurn: boolean) {
 
 function GameRoomInner() {
   const searchParams = useSearchParams();
-  const roomCode = searchParams.get('code') || '';
-  const role = searchParams.get('role') || 'host';
-  const roomId = searchParams.get('id') || '';
+  const roomCode = (searchParams.get('code') || '').toUpperCase();
+  const roleParam = searchParams.get('role') || 'host';
+  const roomId = searchParams.get('id') || roomCode.toLowerCase() || 'local';
 
-  const store = useGameStore();
+  // Host / creator = white; joiner = black (pink pieces)
+  const myRole = roleParam === 'guest' || roleParam === 'black' ? 'black' : 'white';
+  const isHost = myRole === 'white';
+  const isOnlineRoom = !!roomCode;
+
   const {
     newGame,
     pieces,
@@ -41,61 +46,174 @@ function GameRoomInner() {
     tick,
     resign,
     captureRequired,
-    maxCaptures,
     engine,
-  } = store;
+    selectSquare,
+    soundEnabled,
+  } = useGameStore();
+
+  const { status: connStatus, opponentOnline, onEvent, broadcast, setOpponentOnline } =
+    useMultiplayer(roomId, roomCode, myRole);
 
   const [boardSize, setBoardSize] = useState(340);
   const [showResult, setShowResult] = useState(false);
+  const [liveMode, setLiveMode] = useState(false); // true when opponent connected → no bot
   const botThinking = useRef(false);
+  const lastMovePly = useRef(0);
+  const applyingRemote = useRef(false);
 
+  // Start game once
   useEffect(() => {
     newGame();
+    lastMovePly.current = 0;
   }, [newGame]);
 
+  // Board size — rAF for smooth resize
   useEffect(() => {
+    let raf = 0;
     const update = () => {
-      const size = Math.min(window.innerWidth - 24, window.innerHeight - 240, 520);
-      setBoardSize(Math.max(280, size));
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const size = Math.min(window.innerWidth - 24, window.innerHeight - 250, 520);
+        setBoardSize(Math.max(280, size));
+      });
     };
     update();
-    window.addEventListener('resize', update);
-    return () => window.removeEventListener('resize', update);
+    window.addEventListener('resize', update, { passive: true });
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', update);
+    };
   }, []);
 
+  // Clocks — light interval
   useEffect(() => {
     if (status !== 'active') return;
-    const id = setInterval(() => tick(), 200);
+    const id = setInterval(() => tick(), 250);
     return () => clearInterval(id);
   }, [status, tick]);
 
   useEffect(() => {
     if (status === 'finished') {
-      const t = setTimeout(() => setShowResult(true), 500);
+      const t = setTimeout(() => setShowResult(true), 400);
       return () => clearTimeout(t);
     }
     setShowResult(false);
   }, [status]);
 
-  // Simple bot: when it's black's turn, pick a random legal move after a short delay
+  // Listen for remote moves
   useEffect(() => {
+    return onEvent((ev: MpEvent) => {
+      if (ev.type === 'player-joined' || ev.type === 'heartbeat') {
+        if (ev.role !== myRole) {
+          setOpponentOnline(true);
+          setLiveMode(true);
+        }
+        return;
+      }
+      if (ev.type !== 'move-made') return;
+      if (ev.by === myRole) return; // ignore echo of own move
+
+      setLiveMode(true);
+      setOpponentOnline(true);
+      applyingRemote.current = true;
+
+      // Sound for opponent move
+      if (soundEnabled !== false) {
+        if (ev.captures?.length) playCaptureSound();
+        else playMoveSound();
+      }
+
+      useGameStore.setState({
+        pieces: ev.pieces,
+        turn: ev.turn,
+        selected: null,
+        legalDestinations: [],
+        legalMoves: [],
+        whiteMs: ev.whiteMs,
+        blackMs: ev.blackMs,
+        status: (ev.status as any) || 'active',
+        winner: ev.winner ?? null,
+        resultReason: ev.resultReason ?? null,
+        lastTick: Date.now(),
+        captureRequired: false,
+      });
+
+      // Rebuild legal moves from engine if possible
+      const eng = useGameStore.getState().engine;
+      if (eng) {
+        eng.pieces = ev.pieces.map((p) => ({ ...p }));
+        eng.turn = ev.turn;
+        eng.winner = ev.winner ?? null;
+        eng.resultReason = ev.resultReason ?? null;
+        const moves = eng.legalMoves();
+        const maxCap = Math.max(0, ...moves.map((m) => m.captures.length));
+        useGameStore.setState({
+          legalMoves: moves,
+          captureRequired: maxCap > 0,
+          maxCaptures: maxCap,
+        });
+      }
+
+      lastMovePly.current = ev.ply || lastMovePly.current + 1;
+      applyingRemote.current = false;
+    });
+  }, [onEvent, myRole, soundEnabled, setOpponentOnline]);
+
+  // After local move, broadcast to opponent
+  const prevTurn = useRef(turn);
+  useEffect(() => {
+    if (applyingRemote.current) return;
+    if (!isOnlineRoom) return;
+    if (prevTurn.current === turn) return;
+    // Turn changed → a move was made locally
+    const s = useGameStore.getState();
+    if (!s.engine) {
+      prevTurn.current = turn;
+      return;
+    }
+    // Only broadcast if WE just moved (turn is now opponent's)
+    const weJustMoved =
+      (myRole === 'white' && turn === 'black') || (myRole === 'black' && turn === 'white');
+    if (weJustMoved || s.status === 'finished') {
+      lastMovePly.current += 1;
+      broadcast({
+        type: 'move-made',
+        from: 0,
+        path: [],
+        captures: [],
+        pieces: s.pieces,
+        turn: s.turn,
+        whiteMs: s.whiteMs,
+        blackMs: s.blackMs,
+        status: s.status,
+        winner: s.winner,
+        resultReason: s.resultReason,
+        ply: lastMovePly.current,
+        by: myRole,
+      });
+      if (liveMode || opponentOnline) setLiveMode(true);
+    }
+    prevTurn.current = turn;
+  }, [turn, status, isOnlineRoom, myRole, broadcast, liveMode, opponentOnline]);
+
+  // Bot only when NOT live multiplayer (solo practice in room)
+  useEffect(() => {
+    if (liveMode || opponentOnline) return; // real opponent — no bot
+    if (!isHost) return; // guest waits; no bot on guest side when alone is ok — guest can also practice
     if (status !== 'active' || turn !== 'black' || !engine || botThinking.current) return;
 
     botThinking.current = true;
-    const delay = 600 + Math.random() * 900;
-
+    const delay = 500 + Math.random() * 700;
     const t = setTimeout(() => {
       const moves = engine.legalMoves('black');
       if (moves.length === 0) {
         botThinking.current = false;
         return;
       }
-      // Prefer captures, otherwise random
       const caps = moves.filter((m) => m.captures.length > 0);
       const pool = caps.length > 0 ? caps : moves;
       const move = pool[Math.floor(Math.random() * pool.length)];
 
-      // Sound for bot move
       if (useGameStore.getState().soundEnabled) {
         if (move.promote) playPromoteSound();
         else if (move.captures.length > 0) playCaptureSound();
@@ -128,7 +246,7 @@ function GameRoomInner() {
       clearTimeout(t);
       botThinking.current = false;
     };
-  }, [turn, status, engine]);
+  }, [turn, status, engine, liveMode, opponentOnline, isHost]);
 
   const cycleCamera = useCallback(() => {
     const modes: CameraMode[] = ['tilted', 'immersive', 'tactical', 'topdown'];
@@ -136,8 +254,36 @@ function GameRoomInner() {
     setCamera(modes[(idx + 1) % modes.length]);
   }, [camera, setCamera]);
 
+  // I can move only on my color's turn
+  const canMove =
+    status === 'active' &&
+    ((myRole === 'white' && turn === 'white') || (myRole === 'black' && turn === 'black'));
+
+  // For guest (black), flip board so pink pieces are at bottom
+  const flipBoard = myRole === 'black';
+
   const whiteCaptured = 20 - pieces.filter((p) => p.color === 'black').length;
   const blackCaptured = 20 - pieces.filter((p) => p.color === 'white').length;
+
+  const connLabel =
+    connStatus === 'connected'
+      ? opponentOnline || liveMode
+        ? 'Live'
+        : 'Connected · waiting'
+      : connStatus === 'connecting'
+      ? 'Connecting…'
+      : connStatus === 'error'
+      ? 'Reconnecting…'
+      : 'Offline';
+
+  const connColor =
+    connStatus === 'connected' && (opponentOnline || liveMode)
+      ? '#3FB98A'
+      : connStatus === 'connected'
+      ? '#F5A524'
+      : connStatus === 'connecting'
+      ? '#9ca3af'
+      : '#E5484D';
 
   return (
     <main className="min-h-dvh flex flex-col max-w-lg mx-auto bg-[#0B0F14] relative overflow-hidden">
@@ -149,15 +295,30 @@ function GameRoomInner() {
         >
           ←
         </Link>
-        <div className="text-center">
-          <p className="text-sm font-medium text-[#e8e6e3]">
-            {roomCode ? (role === 'host' || role === 'white' ? 'Waiting for opponent' : 'Friend') : 'Black (Bot)'}
+        <div className="text-center min-w-0">
+          <p className="text-sm font-medium text-[#e8e6e3] truncate">
+            {isOnlineRoom
+              ? isHost
+                ? opponentOnline || liveMode
+                  ? 'Opponent (pink)'
+                  : 'Waiting for opponent'
+                : 'Host (white)'
+              : 'Black (Bot)'}
           </p>
           <p className="text-xs text-[#6b7280] flex items-center justify-center gap-1.5">
             {roomCode ? (
-              <>Code <span className="text-[#D4A24C] font-semibold tracking-wider">{roomCode}</span></>
+              <>
+                <span className="text-[#D4A24C] font-semibold tracking-wider">{roomCode}</span>
+                <span>·</span>
+                <span className="inline-flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full" style={{ background: connColor }} />
+                  {connLabel}
+                </span>
+              </>
             ) : (
-              <>Demo · <span className="w-1.5 h-1.5 rounded-full bg-[#3FB98A] inline-block" /></>
+              <>
+                Demo · <span className="w-1.5 h-1.5 rounded-full bg-[#3FB98A] inline-block" />
+              </>
             )}
           </p>
         </div>
@@ -169,137 +330,184 @@ function GameRoomInner() {
         </button>
       </div>
 
-      {/* Opponent clock */}
+      {/* You are playing as */}
+      {isOnlineRoom && (
+        <div className="px-4 pb-1 shrink-0">
+          <p className="text-[11px] text-center text-[#6b7280]">
+            You are{' '}
+            <span className="font-semibold" style={{ color: isHost ? '#e8dcc8' : '#ff7eb3' }}>
+              {isHost ? 'White' : 'Pink (Black)'}
+            </span>
+            {canMove ? ' · your turn' : turn === (isHost ? 'black' : 'white') ? " · opponent's turn" : ''}
+          </p>
+        </div>
+      )}
+
+      {/* Top clock = opponent relative to me */}
       <div className="px-4 shrink-0">
         <div className="flex items-center justify-between mb-1">
           <div className="flex gap-0.5 items-center">
-            {Array.from({ length: Math.min(whiteCaptured, 10) }).map((_, i) => (
-              <div
-                key={i}
-                className="w-2.5 h-2.5 rounded-full"
-                style={{ background: 'linear-gradient(145deg, #f8f4ec, #d4c4a8)' }}
-              />
-            ))}
-            {whiteCaptured > 10 && (
-              <span className="text-[10px] text-[#9ca3af] ml-0.5">+{whiteCaptured - 10}</span>
+            {Array.from({ length: Math.min(isHost ? whiteCaptured : blackCaptured, 10) }).map(
+              (_, i) => (
+                <div
+                  key={i}
+                  className="w-2.5 h-2.5 rounded-full"
+                  style={{
+                    background: isHost
+                      ? 'linear-gradient(145deg, #fffef9, #d4c4a0)'
+                      : 'linear-gradient(145deg, #ffc0d9, #e84393)',
+                  }}
+                />
+              )
             )}
           </div>
-          <p className="text-sm tabular font-medium" style={{ color: clockColor(blackMs, turn === 'black') }}>
-            {formatMs(blackMs)}
+          <p
+            className="text-sm tabular font-medium"
+            style={{
+              color: clockColor(isHost ? blackMs : whiteMs, turn === (isHost ? 'black' : 'white')),
+            }}
+          >
+            {formatMs(isHost ? blackMs : whiteMs)}
           </p>
         </div>
         <div className="clock-bar">
           <div
             style={{
-              width: `${Math.min(100, (blackMs / 180000) * 100)}%`,
-              background: clockColor(blackMs, turn === 'black'),
-              transition: 'width 0.2s linear',
+              width: `${Math.min(100, ((isHost ? blackMs : whiteMs) / 180000) * 100)}%`,
+              background: clockColor(
+                isHost ? blackMs : whiteMs,
+                turn === (isHost ? 'black' : 'white')
+              ),
+              transition: 'width 0.25s linear',
             }}
           />
         </div>
       </div>
 
-      {/* Turn banner */}
-      <div className="text-center py-1.5 shrink-0 h-7">
+      <div className="text-center py-1 shrink-0 h-6">
         {status === 'active' && (
-          <p className="text-xs font-medium" style={{ color: turn === 'white' ? '#D4A24C' : '#9ca3af' }}>
-            {turn === 'white' ? 'Your turn — tap a piece' : 'Bot is thinking…'}
-            {captureRequired && turn === 'white' && (
-              <span className="ml-2 text-[#F5A524]">· Capture required</span>
-            )}
+          <p className="text-xs font-medium" style={{ color: canMove ? '#D4A24C' : '#9ca3af' }}>
+            {canMove
+              ? captureRequired
+                ? 'Capture required — tap piece'
+                : 'Your turn — tap a piece'
+              : liveMode || opponentOnline
+              ? 'Opponent thinking…'
+              : isHost
+              ? 'Bot thinking…'
+              : 'Waiting for host…'}
           </p>
         )}
       </div>
 
       {/* Board */}
-      <div className="flex-1 flex items-center justify-center px-2 min-h-0">
-        <Board3D boardSize={boardSize} interactive={status === 'active' && turn === 'white'} />
+      <div
+        className="flex-1 flex items-center justify-center px-2 min-h-0"
+        style={{
+          transform: flipBoard ? 'rotate(180deg)' : undefined,
+        }}
+      >
+        <Board3D
+          boardSize={boardSize}
+          interactive={canMove}
+          flipPieces={flipBoard}
+        />
       </div>
 
-      {/* Your clock */}
+      {/* Bottom clock = me */}
       <div className="px-4 shrink-0 mt-1">
         <div className="flex items-center justify-between mb-1">
-          <p className="text-sm tabular font-medium" style={{ color: clockColor(whiteMs, turn === 'white') }}>
-            {formatMs(whiteMs)}
+          <p
+            className="text-sm tabular font-medium"
+            style={{
+              color: clockColor(isHost ? whiteMs : blackMs, canMove),
+            }}
+          >
+            {formatMs(isHost ? whiteMs : blackMs)}
           </p>
           <div className="flex gap-0.5 items-center">
-            {Array.from({ length: Math.min(blackCaptured, 10) }).map((_, i) => (
-              <div
-                key={i}
-                className="w-2.5 h-2.5 rounded-full"
-                style={{ background: 'linear-gradient(145deg, #3a3a3a, #1a1a1a)' }}
-              />
-            ))}
-            {blackCaptured > 10 && (
-              <span className="text-[10px] text-[#9ca3af] ml-0.5">+{blackCaptured - 10}</span>
+            {Array.from({ length: Math.min(isHost ? blackCaptured : whiteCaptured, 10) }).map(
+              (_, i) => (
+                <div
+                  key={i}
+                  className="w-2.5 h-2.5 rounded-full"
+                  style={{
+                    background: isHost
+                      ? 'linear-gradient(145deg, #ffc0d9, #e84393)'
+                      : 'linear-gradient(145deg, #fffef9, #d4c4a0)',
+                  }}
+                />
+              )
             )}
           </div>
         </div>
         <div className="clock-bar">
           <div
             style={{
-              width: `${Math.min(100, (whiteMs / 180000) * 100)}%`,
-              background: clockColor(whiteMs, turn === 'white'),
-              transition: 'width 0.2s linear',
-              boxShadow: turn === 'white' ? '0 0 8px #D4A24C55' : undefined,
+              width: `${Math.min(100, ((isHost ? whiteMs : blackMs) / 180000) * 100)}%`,
+              background: clockColor(isHost ? whiteMs : blackMs, canMove),
+              transition: 'width 0.25s linear',
+              boxShadow: canMove ? '0 0 8px #D4A24C55' : undefined,
             }}
           />
         </div>
       </div>
 
-      {/* Action bar */}
       <div className="action-bar mt-2 shrink-0">
-        <button className="action-btn" onClick={cycleCamera}>
+        <button type="button" className="action-btn" onClick={cycleCamera}>
           <span className="text-base">↻</span>
           <span>3D</span>
         </button>
-        <button className="action-btn" onClick={() => newGame()}>
+        <button
+          type="button"
+          className="action-btn"
+          onClick={() => {
+            newGame();
+            lastMovePly.current = 0;
+            broadcast({
+              type: 'move-made',
+              from: 0,
+              path: [],
+              captures: [],
+              pieces: useGameStore.getState().pieces,
+              turn: 'white',
+              whiteMs: 180000,
+              blackMs: 180000,
+              status: 'active',
+              winner: null,
+              resultReason: null,
+              ply: 0,
+              by: myRole,
+            });
+          }}
+        >
           <span className="text-base">⟲</span>
           <span>New</span>
         </button>
-        <button className="action-btn" disabled>
-          <span className="text-base">☰</span>
-          <span>Moves</span>
-        </button>
-        <button className="action-btn danger" onClick={resign} disabled={status !== 'active'}>
+        <button
+          type="button"
+          className="action-btn danger"
+          onClick={resign}
+          disabled={status !== 'active'}
+        >
           <span className="text-base">🏳</span>
           <span>Resign</span>
         </button>
       </div>
 
-      {/* Result sheet */}
       {showResult && (
         <div className="absolute inset-0 z-50 flex items-end justify-center bg-black/65 backdrop-blur-sm">
           <div className="w-full max-w-lg rounded-t-3xl bg-[#131A22] border-t border-[#2a3340] p-6 pb-10">
             <div className="w-10 h-1 rounded-full bg-[#2a3340] mx-auto mb-5" />
             <h2 className="text-2xl font-semibold text-center text-[#e8e6e3]">
-              {winner === 'white' ? 'Victory!' : winner === 'black' ? 'Defeat' : 'Draw'}
+              {winner === myRole ? 'Victory!' : winner && winner !== 'draw' ? 'Defeat' : 'Draw'}
             </h2>
             <p className="text-center text-sm text-[#9ca3af] mt-1 capitalize">
               {resultReason?.replace(/_/g, ' ') || ''}
             </p>
-
-            <div className="grid grid-cols-3 gap-3 mt-6">
-              <div className="rounded-xl bg-[#1a222c] p-3 text-center">
-                <p className="text-xs text-[#6b7280]">You captured</p>
-                <p className="text-lg font-semibold tabular mt-0.5">{blackCaptured}</p>
-              </div>
-              <div className="rounded-xl bg-[#1a222c] p-3 text-center">
-                <p className="text-xs text-[#6b7280]">Left</p>
-                <p className="text-lg font-semibold tabular mt-0.5">
-                  {pieces.filter((p) => p.color === 'white').length}
-                </p>
-              </div>
-              <div className="rounded-xl bg-[#1a222c] p-3 text-center">
-                <p className="text-xs text-[#6b7280]">Kings</p>
-                <p className="text-lg font-semibold tabular mt-0.5">
-                  {pieces.filter((p) => p.color === 'white' && p.isKing).length}
-                </p>
-              </div>
-            </div>
-
             <div className="flex gap-3 mt-6">
               <button
+                type="button"
                 onClick={() => {
                   setShowResult(false);
                   newGame();
@@ -324,7 +532,11 @@ function GameRoomInner() {
 
 export default function GameRoomPage() {
   return (
-    <Suspense fallback={<div className="min-h-dvh flex items-center justify-center text-[#9ca3af]">Loading room…</div>}>
+    <Suspense
+      fallback={
+        <div className="min-h-dvh flex items-center justify-center text-[#9ca3af]">Loading room…</div>
+      }
+    >
       <GameRoomInner />
     </Suspense>
   );

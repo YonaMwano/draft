@@ -14,9 +14,11 @@ const ROTATE: Record<CameraMode, number> = {
 export default function Board3D({
   boardSize = 360,
   interactive = true,
+  flipPieces = false,
 }: {
   boardSize?: number;
   interactive?: boolean;
+  flipPieces?: boolean;
 }) {
   const {
     pieces,
@@ -122,6 +124,8 @@ export default function Board3D({
                   boxShadow: isDark && !isNeon ? 'inset 0 1px 2px rgba(0,0,0,0.3)' : undefined,
                   border: isNeon && isDark ? '1px solid #00E5FF18' : undefined,
                   cursor: playableSq !== null && interactive ? 'pointer' : 'default',
+                  touchAction: 'manipulation',
+                  WebkitTapHighlightColor: 'transparent',
                 }}
               >
                 {isLegal && (
@@ -155,6 +159,7 @@ export default function Board3D({
                     accent={accent}
                     isNeon={isNeon}
                     dimmed={status === 'active' && piece.color !== turn}
+                    flip={flipPieces}
                   />
                 )}
               </div>
@@ -179,6 +184,7 @@ function PieceView({
   accent,
   isNeon,
   dimmed,
+  flip,
 }: {
   piece: { color: 'white' | 'black'; isKing: boolean };
   size: number;
@@ -186,6 +192,7 @@ function PieceView({
   accent: string;
   isNeon: boolean;
   dimmed?: boolean;
+  flip?: boolean;
 }) {
   const isWhite = piece.color === 'white';
 
@@ -214,11 +221,15 @@ function PieceView({
       style={{
         width: size,
         height: size,
-        transform: selected ? 'translateZ(14px) scale(1.12)' : 'translateZ(2px)',
+        transform: [
+          flip ? 'rotate(180deg)' : '',
+          selected ? 'translateZ(14px) scale(1.12)' : 'translateZ(2px)',
+        ].filter(Boolean).join(' '),
         opacity: dimmed ? 0.75 : 1,
         transformStyle: 'preserve-3d',
-        willChange: selected ? 'transform' : 'auto',
+        // Avoid permanent will-change (causes jank on mobile)
         zIndex: selected ? 20 : 5,
+        touchAction: 'manipulation',
       }}
     >
       {/* Contact shadow on board */}
