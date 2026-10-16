@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { createPusherClient, channels } from '@/lib/pusher';
+import { createPusherClient } from '@/lib/pusher-client';
 import type { Piece, Move, Color } from '@/lib/localEngine';
 
 export type ConnStatus = 'connecting' | 'connected' | 'disconnected' | 'error';

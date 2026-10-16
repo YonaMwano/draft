@@ -7,6 +7,9 @@
 
 [build.environment]
   NODE_VERSION = "22"
+  # These Pusher values identify the public browser client; they are not secrets.
+  # Continue scanning all private credentials and all files.
+  SECRETS_SCAN_OMIT_KEYS = "NEXT_PUBLIC_PUSHER_KEY,NEXT_PUBLIC_PUSHER_CLUSTER"
   # Next.js plugin handles the rest
   NETLIFY_NEXT_PLUGIN_SKIP = "false"
 

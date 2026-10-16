@@ -3,7 +3,6 @@ import { cookies } from 'next/headers';
 import { sql } from './db';
 import { v4 as uuidv4 } from 'uuid';
 
-const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me-in-production-32chars!!';
 const SESSION_DAYS_LONG = 30;
 const SESSION_DAYS_SHORT = 1;
 
@@ -21,7 +20,9 @@ export function verifyPassword(password: string, hash: string, salt: string): bo
 }
 
 function hmacToken(token: string): string {
-  return createHash('sha256').update(token + SESSION_SECRET).digest('hex');
+  const secret = process.env.SESSION_SECRET;
+  if (!secret) throw new Error('SESSION_SECRET is required');
+  return createHash('sha256').update(token + secret).digest('hex');
 }
 
 export async function createSession(

@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 import { sql } from '@/lib/db';
 import { getSessionUser } from '@/lib/auth';
-import { pusherServer, channels } from '@/lib/pusher';
+import { getPusherServer } from '@/lib/pusher-server';
+import { channels } from '@/lib/pusher';
 
 /** POST /api/challenges/join — { code } → sit as black (or free seat) and start game */
 export async function POST(req: Request) {
@@ -65,7 +66,7 @@ export async function POST(req: Request) {
     const u = updated[0] as any;
 
     try {
-      await pusherServer.trigger(channels.game(g.id), 'player-joined', {
+      await getPusherServer().trigger(channels.game(g.id), 'player-joined', {
         gameId: g.id,
         status: u.status,
         whiteId: u.white_id,

@@ -31,20 +31,19 @@ npm install
 2. Paste the entire contents of `schema.sql` and run it
 3. Confirm tables appear: `users`, `sessions`, `games`, `moves`, etc.
 
-The connection string is already in `.env.local` (and hard-coded as fallback in `src/lib/db.ts`).
+Set `DATABASE_URL` in Netlify environment variables and in an ignored `.env.local` for local development. No database credentials are stored in source.
 
 ### 3. Pusher
-
-The key you supplied was treated as:
-
-- `NEXT_PUBLIC_PUSHER_KEY=de2ZYOo4oykhBT6Qj26kaQ`
-- `PUSHER_SECRET=lG8pvOxbqirCxz8EZ4GM`
 
 Go to [Pusher Dashboard](https://dashboard.pusher.com) and:
 
 1. Create (or open) an app
 2. Copy **App ID**, **Key**, **Secret**, **Cluster**
-3. Update `.env.local` accordingly
+3. Set `PUSHER_APP_ID`, `PUSHER_SECRET`, `NEXT_PUBLIC_PUSHER_KEY`, and `NEXT_PUBLIC_PUSHER_CLUSTER` in Netlify environment variables and your ignored `.env.local`.
+
+Set `SESSION_SECRET` to a strong random value for session signing. Private values must remain server-side. The two `NEXT_PUBLIC_PUSHER_*` settings are intentionally included in browser bundles and are the only keys excluded from Netlify secrets scanning.
+
+Previously committed database and Pusher credentials must be rotated with their providers. Rotate the session secret to invalidate existing sessions. Coordinate any Git history cleanup across repository clones; removing credentials from current files does not remove historical exposure.
 
 Enable **Client Events** if you want emotes from the client; otherwise all events go through the Next.js route handlers (recommended for authority).
 
@@ -100,7 +99,9 @@ src/
   lib/
     db.ts                 Neon serverless + pg Pool
     auth.ts               scrypt + HMAC sessions
-    pusher.ts             Server + client factories
+    pusher.ts             Shared channels and event types
+    pusher-client.ts      Public browser client
+    pusher-server.ts      Server-only realtime delivery
     engine.ts             dawikk-draughts wrapper
   store/
     gameStore.ts          Zustand – optimistic moves, clocks, UI
