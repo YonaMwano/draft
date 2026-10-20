@@ -37,8 +37,8 @@ The connection string is already in `.env.local` (and hard-coded as fallback in 
 
 The key you supplied was treated as:
 
-- `NEXT_PUBLIC_PUSHER_KEY=de2ZYOo4oykhBT6Qj26kaQ`
-- `PUSHER_SECRET=lG8pvOxbqirCxz8EZ4GM`
+- `NEXT_PUBLIC_PUSHER_KEY=`
+- `PUSHER_SECRET=l
 
 Go to [Pusher Dashboard](https://dashboard.pusher.com) and:
 
