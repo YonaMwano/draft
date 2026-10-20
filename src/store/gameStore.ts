@@ -29,6 +29,7 @@ interface GameState {
   maxCaptures: number;
   soundEnabled: boolean;
 
+  onlineMove: ((move: Move) => void) | null;
   newGame: () => void;
   selectSquare: (sq: number) => void;
   setCamera: (m: CameraMode) => void;
@@ -54,6 +55,7 @@ function playForMove(move: Move, soundEnabled: boolean) {
 }
 
 export const useGameStore = create<GameState>((set, get) => ({
+  onlineMove: null,
   engine: null,
   pieces: [],
   turn: 'white',
@@ -82,6 +84,8 @@ export const useGameStore = create<GameState>((set, get) => ({
     const moves = engine.legalMoves();
     const maxCap = Math.max(0, ...moves.map((m) => m.captures.length));
     set({
+      onlineMove: null,
+      myColor: 'white',
       engine,
       pieces: engine.getPieces(),
       turn: 'white',
@@ -118,6 +122,11 @@ export const useGameStore = create<GameState>((set, get) => ({
       }
       if (!move) return;
 
+      if (s.onlineMove) {
+        if (s.turn !== s.myColor) return;
+        s.onlineMove(move);
+        return;
+      }
       playForMove(move, s.soundEnabled);
 
       s.engine.applyMove(move);

@@ -1,7 +1,6 @@
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'crypto';
+import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'crypto';
 import { cookies } from 'next/headers';
 import { sql } from './db';
-import { v4 as uuidv4 } from 'uuid';
 
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me-in-production-32chars!!';
 const SESSION_DAYS_LONG = 30;
@@ -86,7 +85,7 @@ export function setSessionCookie(token: string, rememberMe: boolean) {
 }
 
 export async function createGuestUser(): Promise<{ id: string; token: string }> {
-  const id = uuidv4();
+  const id = randomUUID();
   const seed = randomBytes(8).toString('hex');
   await sql`
     INSERT INTO users (id, is_guest, avatar_seed, username)
