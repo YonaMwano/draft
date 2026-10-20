@@ -1,192 +1,91 @@
 'use client';
-
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { createPusherClient, channels } from '@/lib/pusher';
-import type { Piece, Move, Color } from '@/lib/localEngine';
-
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { LocalGame, type Color, type Move } from '@/lib/localEngine';
+import { useGameStore } from '@/store/gameStore';
+import type { RoomState } from '../../db/schema';
 export type ConnStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
+type Snapshot = { role: Color; version: number; state: RoomState; initialMs: number; incrementMs: number; opponentOnline: boolean; error?: string };
 
-export type MpEvent =
-  | {
-      type: 'move-made';
-      from: number;
-      path: number[];
-      captures: number[];
-      pieces: Piece[];
-      turn: Color;
-      whiteMs: number;
-      blackMs: number;
-      status: string;
-      winner?: Color | 'draw' | null;
-      resultReason?: string | null;
-      ply: number;
-      by: string; // role host|guest
-    }
-  | { type: 'player-joined'; role: string; code: string }
-  | { type: 'player-ready'; role: string }
-  | { type: 'heartbeat'; role: string; at: number };
-
-/**
- * Real-time channel for a private game room.
- * Uses Pusher when configured; falls back to BroadcastChannel (same browser)
- * + short polling so two tabs can still play.
- */
-export function useMultiplayer(roomId: string, code: string, role: string) {
+/** Server-authoritative state, synchronized across devices every 750ms. */
+export function useMultiplayer(code: string) {
   const [status, setStatus] = useState<ConnStatus>('connecting');
   const [opponentOnline, setOpponentOnline] = useState(false);
-  const handlers = useRef<Set<(e: MpEvent) => void>>(new Set());
-  const pusherRef = useRef<ReturnType<typeof createPusherClient> | null>(null);
-  const channelRef = useRef<any>(null);
+  const [role, setRole] = useState<Color>('white');
+  const [roomStatus, setRoomStatus] = useState<RoomState['status']>('waiting');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [initialMs, setInitialMs] = useState(180000);
+  const version = useRef(-1);
+  const inFlight = useRef(false);
+  const generation = useRef(0);
 
-  const onEvent = useCallback((fn: (e: MpEvent) => void) => {
-    handlers.current.add(fn);
-    return () => {
-      handlers.current.delete(fn);
-    };
-  }, []);
-
-  const emitLocal = useCallback((e: MpEvent) => {
-    handlers.current.forEach((fn) => {
-      try {
-        fn(e);
-      } catch (_) {}
-    });
-  }, []);
-
-  const broadcast = useCallback(
-    async (event: MpEvent) => {
-      // 1) BroadcastChannel (instant, same device / tabs)
-      try {
-        const bc = new BroadcastChannel(`drafts-${code || roomId}`);
-        bc.postMessage(event);
-        bc.close();
-      } catch (_) {}
-
-      // 2) localStorage event bus (cross-tab)
-      try {
-        localStorage.setItem(
-          `drafts-mp:${code || roomId}`,
-          JSON.stringify({ ...event, _t: Date.now() })
-        );
-      } catch (_) {}
-
-      // 3) Pusher (true multiplayer across devices)
-      try {
-        if (channelRef.current && status === 'connected') {
-          // client events need enabled on Pusher dashboard; also try REST via API
-        }
-        await fetch('/api/games/sync', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            roomId,
-            code,
-            role,
-            event,
-          }),
-        }).catch(() => {});
-      } catch (_) {}
-    },
-    [roomId, code, role, status]
-  );
+  const sync = useCallback(async (action = 'sync', move?: Move) => {
+    if (!code || inFlight.current) return;
+    inFlight.current = true;
+    const currentGeneration = generation.current;
+    setBusy(true);
+    try {
+      const token = sessionStorage.getItem(`room-token:${code}`);
+      if (!token) throw new Error('Join this room with its code to restore your seat.');
+      const response = await fetch('/api/games/sync', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, token, version: version.current, action, move }),
+        signal: AbortSignal.timeout(8000), cache: 'no-store',
+      });
+      const data: Snapshot = await response.json();
+      if (currentGeneration !== generation.current) return;
+      if (!response.ok && !data.state) throw new Error(data.error || 'Connection lost. Reconnecting…');
+      version.current = data.version;
+      setRole(data.role); setRoomStatus(data.state.status); setOpponentOnline(data.opponentOnline);
+      setInitialMs(data.initialMs); setStatus('connected'); setError(data.error || '');
+      const engine = new LocalGame();
+      engine.pieces = data.state.pieces.map(p => ({ ...p })); engine.turn = data.state.turn;
+      engine.winner = data.state.winner; engine.resultReason = data.state.resultReason;
+      const legalMoves = engine.legalMoves();
+      const maxCaptures = Math.max(0, ...legalMoves.map(m => m.captures.length));
+      const old = useGameStore.getState();
+      const changed = old.turn !== data.state.turn || JSON.stringify(old.pieces) !== JSON.stringify(data.state.pieces);
+      useGameStore.setState({
+        engine, pieces: engine.getPieces(), turn: engine.turn, myColor: data.role,
+        status: data.state.status === 'waiting' ? 'idle' : data.state.status,
+        winner: data.state.winner, resultReason: data.state.resultReason,
+        whiteMs: data.state.whiteMs, blackMs: data.state.blackMs,
+        incrementMs: data.incrementMs, lastTick: Date.now(), legalMoves,
+        captureRequired: maxCaptures > 0, maxCaptures,
+        ...(changed ? { selected: null, legalDestinations: [], hopPath: [] } : {}),
+      });
+    } catch (err) {
+      if (currentGeneration !== generation.current) return;
+      setStatus('disconnected'); setOpponentOnline(false);
+      setError(err instanceof Error ? err.message : 'Connection lost. Reconnecting…');
+    } finally {
+      inFlight.current = false;
+      if (currentGeneration === generation.current) setBusy(false);
+    }
+  }, [code]);
 
   useEffect(() => {
-    if (!roomId && !code) return;
-    const key = code || roomId;
-    let cancelled = false;
+    generation.current++;
+    version.current = -1;
+    useGameStore.setState({ status: 'idle', selected: null, legalDestinations: [] });
+    void sync();
+    const timer = setInterval(() => void sync(), 750);
+    const reconnect = () => void sync();
+    window.addEventListener('online', reconnect);
+    window.addEventListener('focus', reconnect);
+    return () => { generation.current++; clearInterval(timer); window.removeEventListener('online', reconnect); window.removeEventListener('focus', reconnect); };
+  }, [sync]);
 
-    // BroadcastChannel listener
-    let bc: BroadcastChannel | null = null;
-    try {
-      bc = new BroadcastChannel(`drafts-${key}`);
-      bc.onmessage = (msg) => {
-        if (msg?.data?.type) emitLocal(msg.data as MpEvent);
-        if (msg?.data?.type === 'player-joined' || msg?.data?.type === 'heartbeat') {
-          setOpponentOnline(true);
-        }
-      };
-    } catch (_) {}
-
-    // storage listener
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== `drafts-mp:${key}` || !e.newValue) return;
-      try {
-        const data = JSON.parse(e.newValue);
-        if (data?.type) emitLocal(data);
-        if (data?.type === 'player-joined' || data?.type === 'move-made') {
-          setOpponentOnline(true);
-        }
-      } catch (_) {}
-    };
-    window.addEventListener('storage', onStorage);
-
-    // Pusher
-    try {
-      const client = createPusherClient();
-      pusherRef.current = client;
-      const chName = `private-game-${key}`;
-      // public channel works without auth endpoint
-      const ch = client.subscribe(`game-${key}`);
-      channelRef.current = ch;
-
-      client.connection.bind('connected', () => {
-        if (!cancelled) setStatus('connected');
-      });
-      client.connection.bind('disconnected', () => {
-        if (!cancelled) setStatus('disconnected');
-      });
-      client.connection.bind('error', () => {
-        if (!cancelled) setStatus('error');
-      });
-
-      ch.bind('move-made', (data: MpEvent) => emitLocal(data));
-      ch.bind('player-joined', (data: MpEvent) => {
-        setOpponentOnline(true);
-        emitLocal(data);
-      });
-      ch.bind('pusher:subscription_succeeded', () => {
-        if (!cancelled) setStatus('connected');
-      });
-
-      // announce join
-      setTimeout(() => {
-        broadcast({ type: 'player-joined', role, code: key });
-      }, 300);
-
-      // heartbeat
-      const hb = setInterval(() => {
-        broadcast({ type: 'heartbeat', role, at: Date.now() });
-      }, 5000);
-
-      // If Pusher never connects, still mark connected for local channels
-      const fallback = setTimeout(() => {
-        if (!cancelled) setStatus((s) => (s === 'connecting' ? 'connected' : s));
-      }, 2000);
-
-      return () => {
-        cancelled = true;
-        clearInterval(hb);
-        clearTimeout(fallback);
-        window.removeEventListener('storage', onStorage);
-        try {
-          bc?.close();
-        } catch (_) {}
-        try {
-          client.unsubscribe(`game-${key}`);
-          client.disconnect();
-        } catch (_) {}
-      };
-    } catch {
-      setStatus('connected'); // local-only mode
-      return () => {
-        cancelled = true;
-        window.removeEventListener('storage', onStorage);
-        try {
-          bc?.close();
-        } catch (_) {}
-      };
+  // Intercept completed selections before any local mutation; only the server applies moves.
+  const selectSquare = useCallback((sq: number) => {
+    const state = useGameStore.getState();
+    if (busy || status !== 'connected' || roomStatus !== 'active' || state.turn !== role) return;
+    if (state.selected !== null && state.legalDestinations.includes(sq)) {
+      const move = state.legalMoves.find(m => m.from === state.selected && m.path[m.path.length - 1] === sq);
+      if (move) void sync('move', move);
+      return;
     }
-  }, [roomId, code, role, broadcast, emitLocal]);
-
-  return { status, opponentOnline, onEvent, broadcast, setOpponentOnline };
+    state.selectSquare(sq);
+  }, [busy, status, roomStatus, role, sync]);
+  return { status, opponentOnline, role, roomStatus, error, busy, initialMs, selectSquare, resign: () => sync('resign') };
 }

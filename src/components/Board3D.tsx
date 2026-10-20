@@ -15,10 +15,12 @@ export default function Board3D({
   boardSize = 360,
   interactive = true,
   flipPieces = false,
+  onSquareClick,
 }: {
   boardSize?: number;
   interactive?: boolean;
   flipPieces?: boolean;
+  onSquareClick?: (sq: number) => void;
 }) {
   const {
     pieces,
@@ -45,12 +47,12 @@ export default function Board3D({
   const handleTap = useCallback(
     (sq: number) => {
       if (!interactive || status !== 'active') return;
-      selectSquare(sq);
+      (onSquareClick || selectSquare)(sq);
       if (typeof navigator !== 'undefined' && navigator.vibrate) {
         navigator.vibrate(12);
       }
     },
-    [interactive, status, selectSquare]
+    [interactive, status, selectSquare, onSquareClick]
   );
 
   const squarePx = boardSize / 10;
